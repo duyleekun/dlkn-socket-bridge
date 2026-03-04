@@ -1,0 +1,24 @@
+[package]
+name = "dlkn-socket-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "5"
+reqwest = { version = "0.12", features = ["stream", "json"] }
+uuid = { version = "1", features = ["v4"] }
+tokio-tungstenite = "0.21"
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-native-certs = "0.7"
+futures-util = "0.3"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+http = "1"
+anyhow = "1"
