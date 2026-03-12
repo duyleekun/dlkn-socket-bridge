@@ -31,6 +31,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+
 #[derive(Clone)]
 struct AppState {
     registry: Registry,
@@ -56,6 +58,8 @@ enum Protocol {
     Tcp,
     Tls,
     Ws,
+    LocoFrame,
+    MtprotoFrame,
 }
 
 enum BridgeCommand {
@@ -192,10 +196,12 @@ async fn create_socket(
         "tcp" => Protocol::Tcp,
         "tls" | "tcps" => Protocol::Tls,
         "ws" | "wss" => Protocol::Ws,
+        "loco-frame" => Protocol::LocoFrame,
+        "mtproto-frame" => Protocol::MtprotoFrame,
         other => {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                format!("unsupported scheme: {other} (expected tcp://, tls://, tcps://, ws://, or wss://)"),
+                format!("unsupported scheme: {other} (expected tcp://, tls://, tcps://, ws://, wss://, loco-frame://, or mtproto-frame://)"),
             ))
         }
     };
@@ -278,6 +284,40 @@ async fn create_socket(
                 Ok(reason) => reason,
                 Err(err) => {
                     error!(socket_id = %engine_socket_id, error = %err, "tls engine error");
+                    "error"
+                }
+            },
+            Protocol::LocoFrame => match run_loco_frame_engine(
+                engine_state.clone(),
+                target,
+                callback.clone(),
+                cmd_rx,
+                bytes_rx,
+                bytes_tx,
+                &engine_socket_id,
+            )
+            .await
+            {
+                Ok(reason) => reason,
+                Err(err) => {
+                    error!(socket_id = %engine_socket_id, error = %err, "loco-frame engine error");
+                    "error"
+                }
+            },
+            Protocol::MtprotoFrame => match run_mtproto_frame_engine(
+                engine_state.clone(),
+                target,
+                callback.clone(),
+                cmd_rx,
+                bytes_rx,
+                bytes_tx,
+                &engine_socket_id,
+            )
+            .await
+            {
+                Ok(reason) => reason,
+                Err(err) => {
+                    error!(socket_id = %engine_socket_id, error = %err, "mtproto-frame engine error");
                     "error"
                 }
             },
@@ -489,6 +529,160 @@ where
         let payload = Bytes::from(flush_buf);
         post_callback_binary(&state.http, &callback_url, payload).await;
     }
+
+    Ok(close_reason)
+}
+
+async fn run_loco_frame_engine(
+    state: AppState,
+    target_url: reqwest::Url,
+    callback_url: reqwest::Url,
+    mut cmd_rx: mpsc::UnboundedReceiver<BridgeCommand>,
+    bytes_rx: SharedCounter,
+    bytes_tx: SharedCounter,
+    socket_id: &str,
+) -> anyhow::Result<&'static str> {
+    let host = target_url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("target missing host"))?
+        .to_owned();
+    let port = target_url
+        .port()
+        .ok_or_else(|| anyhow::anyhow!("target missing port"))?;
+
+    let tcp = TcpStream::connect((host.as_str(), port)).await?;
+    info!(socket_id = %socket_id, host = %host, port, "loco-frame connected");
+
+    let (mut rx, mut tx) = tokio::io::split(tcp);
+
+    let close_reason = loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(BridgeCommand::Send(data)) => {
+                        bytes_tx.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        tx.write_all(&data).await?;
+                    }
+                    Some(BridgeCommand::Close) | None => {
+                        break "command";
+                    }
+                }
+            }
+
+            result = async {
+                let mut hdr = [0u8; 4];
+                rx.read_exact(&mut hdr).await?;
+                let total_size = u32::from_le_bytes(hdr) as usize;
+                if total_size > MAX_FRAME_SIZE {
+                    anyhow::bail!("loco frame too large: {total_size} bytes (max {MAX_FRAME_SIZE})");
+                }
+                // total_size = encryptedLen + 12; full frame = 4 + total_size bytes
+                let mut rest = vec![0u8; total_size];
+                rx.read_exact(&mut rest).await?;
+                let mut frame = Vec::with_capacity(4 + total_size);
+                frame.extend_from_slice(&hdr);
+                frame.extend_from_slice(&rest);
+                Ok::<_, anyhow::Error>(frame)
+            } => {
+                match result {
+                    Ok(frame) => {
+                        bytes_rx.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                        post_callback_binary(&state.http, &callback_url, Bytes::from(frame)).await;
+                    }
+                    Err(err) => {
+                        if err.downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
+                        {
+                            break "remote_close";
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(close_reason)
+}
+
+async fn run_mtproto_frame_engine(
+    state: AppState,
+    target_url: reqwest::Url,
+    callback_url: reqwest::Url,
+    mut cmd_rx: mpsc::UnboundedReceiver<BridgeCommand>,
+    bytes_rx: SharedCounter,
+    bytes_tx: SharedCounter,
+    socket_id: &str,
+) -> anyhow::Result<&'static str> {
+    let host = target_url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("target missing host"))?
+        .to_owned();
+    let port = target_url
+        .port()
+        .ok_or_else(|| anyhow::anyhow!("target missing port"))?;
+
+    let tcp = TcpStream::connect((host.as_str(), port)).await?;
+    let (mut rx, mut tx) = tokio::io::split(tcp);
+
+    // Send MTProto Intermediate transport identifier
+    tx.write_all(&0xeeeeeeeeu32.to_le_bytes()).await?;
+    info!(socket_id = %socket_id, host = %host, port, "mtproto-frame connected (intermediate transport)");
+
+    let close_reason = loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(BridgeCommand::Send(data)) => {
+                        bytes_tx.fetch_add(data.len() as u64, Ordering::Relaxed);
+                        tx.write_all(&data).await?;
+                    }
+                    Some(BridgeCommand::Close) | None => {
+                        break "command";
+                    }
+                }
+            }
+
+            result = async {
+                let mut hdr = [0u8; 4];
+                rx.read_exact(&mut hdr).await?;
+                let length_field = u32::from_le_bytes(hdr);
+
+                // High bit set = quick ack (4 bytes total, no payload follows)
+                if length_field & 0x80000000 != 0 {
+                    return Ok(hdr.to_vec());
+                }
+
+                let payload_len = length_field as usize;
+                if payload_len > MAX_FRAME_SIZE {
+                    anyhow::bail!("mtproto frame too large: {payload_len} bytes (max {MAX_FRAME_SIZE})");
+                }
+
+                // Return length header + payload as a single frame
+                let mut frame = Vec::with_capacity(4 + payload_len);
+                frame.extend_from_slice(&hdr);
+                let mut payload = vec![0u8; payload_len];
+                rx.read_exact(&mut payload).await?;
+                frame.extend_from_slice(&payload);
+                Ok(frame)
+            } => {
+                match result {
+                    Ok(frame) => {
+                        bytes_rx.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                        post_callback_binary(&state.http, &callback_url, Bytes::from(frame)).await;
+                    }
+                    Err(err) => {
+                        if err.downcast_ref::<std::io::Error>()
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
+                        {
+                            break "remote_close";
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    };
 
     Ok(close_reason)
 }
