@@ -8,9 +8,9 @@ use std::{
 };
 
 use axum::{
-    body::Bytes as AxumBytes,
+    body::{to_bytes, Body, Bytes as AxumBytes},
     extract::{Path, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -28,6 +28,7 @@ use tokio::{
     time::{Duration, Instant},
 };
 use tokio_tungstenite::tungstenite::Message;
+use tower::util::ServiceExt;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -91,9 +92,17 @@ struct SocketStatusResponse {
 }
 
 #[derive(Serialize)]
+struct SocketHealthResponse {
+    socket_id: String,
+    protocol: Protocol,
+    uptime_secs: u64,
+    bytes_rx: u64,
+    bytes_tx: u64,
+}
+
+#[derive(Serialize)]
 struct ClosedEvent<'a> {
     event: &'static str,
-    socket_id: &'a str,
     reason: &'a str,
 }
 
@@ -140,13 +149,35 @@ fn should_flush(buf: &[u8], last_flush: Instant, flush: &FlushConfig) -> bool {
     if flush.bytes.map_or(false, |n| buf.len() >= n) {
         return true;
     }
-    if flush
-        .interval_ms
-        .map_or(false, |ms| last_flush.elapsed() >= Duration::from_millis(ms))
-    {
+    if flush.interval_ms.map_or(false, |ms| {
+        last_flush.elapsed() >= Duration::from_millis(ms)
+    }) {
         return true;
     }
     false
+}
+
+fn build_app(state: AppState) -> Router {
+    Router::new()
+        .route("/sockets", post(create_socket).get(list_sockets))
+        .route("/sockets/", get(list_sockets))
+        .route(
+            "/sockets/:id",
+            get(get_socket_status)
+                .post(send_socket)
+                .delete(delete_socket),
+        )
+        .with_state(state)
+}
+
+fn socket_status_from_meta(socket_id: String, entry: &SessionMeta) -> SocketHealthResponse {
+    SocketHealthResponse {
+        socket_id,
+        protocol: entry.protocol,
+        uptime_secs: entry.created_at.elapsed().as_secs(),
+        bytes_rx: entry.bytes_rx.load(Ordering::Relaxed),
+        bytes_tx: entry.bytes_tx.load(Ordering::Relaxed),
+    }
 }
 
 #[tokio::main]
@@ -163,11 +194,7 @@ async fn main() {
         http: HttpClient::new(),
     };
 
-    let app = Router::new()
-        .route("/sockets", post(create_socket))
-        .route("/sockets/:id", get(get_socket_status).delete(delete_socket))
-        .route("/sockets/:id/send", post(send_socket))
-        .with_state(state);
+    let app = build_app(state);
 
     let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let addr = SocketAddr::from_str(&bind_addr).expect("invalid BIND_ADDR");
@@ -328,9 +355,19 @@ async fn create_socket(
 
     Ok(Json(CreateSocketResponse {
         socket_id: socket_id.clone(),
-        send_url: format!("/sockets/{socket_id}/send"),
+        send_url: format!("/sockets/{socket_id}"),
         delete_url: format!("/sockets/{socket_id}"),
     }))
+}
+
+async fn list_sockets(State(state): State<AppState>) -> Json<Vec<SocketHealthResponse>> {
+    let mut sockets = state
+        .registry
+        .iter()
+        .map(|entry| socket_status_from_meta(entry.key().clone(), entry.value()))
+        .collect::<Vec<_>>();
+    sockets.sort_by(|left, right| left.socket_id.cmp(&right.socket_id));
+    Json(sockets)
 }
 
 async fn send_socket(
@@ -358,11 +395,12 @@ async fn get_socket_status(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown socket_id"));
     };
 
+    let status = socket_status_from_meta(id, &entry);
     Ok(Json(SocketStatusResponse {
-        protocol: entry.protocol,
-        uptime_secs: entry.created_at.elapsed().as_secs(),
-        bytes_rx: entry.bytes_rx.load(Ordering::Relaxed),
-        bytes_tx: entry.bytes_tx.load(Ordering::Relaxed),
+        protocol: status.protocol,
+        uptime_secs: status.uptime_secs,
+        bytes_rx: status.bytes_rx,
+        bytes_tx: status.bytes_tx,
     }))
 }
 
@@ -390,23 +428,17 @@ async fn post_callback_binary(http: &HttpClient, callback_url: &reqwest::Url, pa
     }
 }
 
-async fn post_callback_closed(
-    http: &HttpClient,
-    callback_url: &reqwest::Url,
-    socket_id: &str,
-    reason: &str,
-) {
+async fn post_callback_closed(http: &HttpClient, callback_url: &reqwest::Url, reason: &str) {
     if let Err(err) = http
         .post(callback_url.clone())
         .json(&ClosedEvent {
             event: "closed",
-            socket_id,
             reason,
         })
         .send()
         .await
     {
-        warn!(%callback_url, %socket_id, error = %err, "failed to post closed callback");
+        warn!(%callback_url, error = %err, "failed to post closed callback");
     }
 }
 
@@ -417,7 +449,7 @@ async fn finalize_session(
     reason: &str,
 ) {
     state.registry.remove(socket_id);
-    post_callback_closed(&state.http, callback_url, socket_id, reason).await;
+    post_callback_closed(&state.http, callback_url, reason).await;
     info!(socket_id = %socket_id, reason, "session closed");
 }
 
@@ -456,10 +488,30 @@ async fn run_tcp_engine(
             .to_owned();
         let tls_stream = connector.connect(server_name, tcp).await?;
         info!(socket_id = %socket_id, host = %host, port, "tls connected");
-        run_stream_engine(tls_stream, state, callback_url, cmd_rx, bytes_rx, bytes_tx, socket_id, flush).await
+        run_stream_engine(
+            tls_stream,
+            state,
+            callback_url,
+            cmd_rx,
+            bytes_rx,
+            bytes_tx,
+            socket_id,
+            flush,
+        )
+        .await
     } else {
         info!(socket_id = %socket_id, host = %host, port, "tcp connected");
-        run_stream_engine(tcp, state, callback_url, cmd_rx, bytes_rx, bytes_tx, socket_id, flush).await
+        run_stream_engine(
+            tcp,
+            state,
+            callback_url,
+            cmd_rx,
+            bytes_rx,
+            bytes_tx,
+            socket_id,
+            flush,
+        )
+        .await
     }
 }
 
@@ -751,4 +803,212 @@ async fn run_ws_engine(
     };
 
     Ok(close_reason)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use tokio::sync::{mpsc, oneshot, Mutex};
+
+    fn test_state() -> AppState {
+        AppState {
+            registry: Arc::new(DashMap::new()),
+            http: HttpClient::new(),
+        }
+    }
+
+    fn insert_test_socket(
+        state: &AppState,
+        socket_id: &str,
+    ) -> mpsc::UnboundedReceiver<BridgeCommand> {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let bytes_rx = Arc::new(AtomicU64::new(128));
+        let bytes_tx = Arc::new(AtomicU64::new(256));
+        state.registry.insert(
+            socket_id.to_string(),
+            SessionMeta {
+                protocol: Protocol::Tcp,
+                cmd_tx,
+                created_at: Instant::now(),
+                bytes_rx,
+                bytes_tx,
+            },
+        );
+        cmd_rx
+    }
+
+    async fn send_request(app: Router, request: Request<Body>) -> Response {
+        app.oneshot(request).await.expect("request should succeed")
+    }
+
+    #[tokio::test]
+    async fn create_session_returns_send_url_without_send_suffix() {
+        let state = test_state();
+        let app = build_app(state);
+
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind target listener");
+        let target_addr = target_listener.local_addr().expect("target addr");
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _) = target_listener
+                .accept()
+                .await
+                .expect("accept target socket");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let callback_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback listener");
+        let callback_addr = callback_listener.local_addr().expect("callback addr");
+        let callback_task = tokio::spawn(async move {
+            let (_stream, _) = callback_listener
+                .accept()
+                .await
+                .expect("accept callback socket");
+        });
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/sockets")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    "{{\"target_url\":\"tcp://{target_addr}\",\"callback_url\":\"http://{callback_addr}/cb\"}}"
+                )))
+                .expect("build request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("parse create response");
+        let socket_id = json["socket_id"].as_str().expect("socket id");
+        assert_eq!(json["send_url"], format!("/sockets/{socket_id}"));
+        assert_eq!(json["delete_url"], format!("/sockets/{socket_id}"));
+
+        accept_task.abort();
+        callback_task.abort();
+    }
+
+    #[tokio::test]
+    async fn post_socket_id_sends_bytes_to_session() {
+        let state = test_state();
+        let mut cmd_rx = insert_test_socket(&state, "socket-1");
+        let app = build_app(state);
+
+        let response = send_request(
+            app,
+            Request::builder()
+                .method("POST")
+                .uri("/sockets/socket-1")
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body(Body::from(vec![1_u8, 2, 3, 4]))
+                .expect("build request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        match cmd_rx.recv().await.expect("bridge command") {
+            BridgeCommand::Send(data) => assert_eq!(data.as_ref(), &[1, 2, 3, 4]),
+            BridgeCommand::Close => panic!("unexpected close command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_sockets_and_trailing_slash_return_sorted_socket_health() {
+        let state = test_state();
+        let _first_rx = insert_test_socket(&state, "socket-b");
+        let _second_rx = insert_test_socket(&state, "socket-a");
+        let app = build_app(state.clone());
+
+        for path in ["/sockets", "/sockets/"] {
+            let response = send_request(
+                app.clone(),
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("read response body");
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("parse list response");
+            let sockets = json.as_array().expect("list response array");
+            assert_eq!(sockets.len(), 2);
+            assert_eq!(sockets[0]["socket_id"], "socket-a");
+            assert_eq!(sockets[1]["socket_id"], "socket-b");
+            assert_eq!(sockets[0]["protocol"], "tcp");
+            assert_eq!(sockets[0]["bytes_rx"], 128);
+            assert_eq!(sockets[0]["bytes_tx"], 256);
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_callback_omits_socket_id() {
+        let captured = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let captured_for_handler = Arc::clone(&captured);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let app = Router::new().route(
+            "/cb",
+            post(move |Json(payload): Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_for_handler);
+                async move {
+                    *captured.lock().await = Some(payload);
+                    StatusCode::OK
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback server");
+        let addr = listener.local_addr().expect("callback server addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("callback server should run");
+        });
+
+        post_callback_closed(
+            &HttpClient::new(),
+            &reqwest::Url::parse(&format!("http://{addr}/cb")).expect("callback url"),
+            "remote_close",
+        )
+        .await;
+
+        for _ in 0..20 {
+            if captured.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let payload = captured
+            .lock()
+            .await
+            .clone()
+            .expect("closed event should be captured");
+        assert_eq!(payload["event"], "closed");
+        assert_eq!(payload["reason"], "remote_close");
+        assert!(payload.get("socket_id").is_none());
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("callback server shutdown");
+    }
 }

@@ -11,7 +11,7 @@ The backend talks to this bridge over HTTP:
 ## What It Does
 
 - Maintains long-lived outbound connections in Rust
-- Exposes a simple HTTP control plane (`/sockets`, `/send`, `DELETE`)
+- Exposes a simple HTTP control plane (`/sockets`, `POST /sockets/:id`, `DELETE`)
 - Forwards inbound data to a callback URL
 - Tracks per-session byte counters and uptime
 
@@ -75,12 +75,32 @@ Response:
 ```json
 {
   "socket_id": "uuid",
-  "send_url": "/sockets/<id>/send",
+  "send_url": "/sockets/<id>",
   "delete_url": "/sockets/<id>"
 }
 ```
 
-### `POST /sockets/:id/send`
+### `GET /sockets` and `GET /sockets/`
+
+Get health for all active sessions.
+
+Response:
+
+```json
+[
+  {
+    "socket_id": "socket-a",
+    "protocol": "tls",
+    "uptime_secs": 12,
+    "bytes_rx": 1024,
+    "bytes_tx": 2048
+  }
+]
+```
+
+The response array is sorted by `socket_id`.
+
+### `POST /sockets/:id`
 
 Send raw bytes to the socket session.
 
@@ -133,7 +153,6 @@ The engine posts to `callback_url` in the background.
 ```json
 {
   "event": "closed",
-  "socket_id": "<id>",
   "reason": "remote_close"
 }
 ```
