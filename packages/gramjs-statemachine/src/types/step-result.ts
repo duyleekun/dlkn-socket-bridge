@@ -1,18 +1,18 @@
 import type { SerializedState } from './state.js';
-import type { Action } from './action.js';
+import type { InternalAction } from './internal-action.js';
 
 /**
  * The result of a single state machine step.
  *
  * - `nextState`: Always returned. **Persist this** before doing anything else.
  * - `outbound`: If present, send these bridge-ready bytes as-is.
- * - `actions`: Side effects to process (UI updates, re-sends, etc.).
+ * - `actions`: Internal reducer outputs consumed by the session runtime.
  */
 export interface StepResult {
   /** Updated state — always persist this. */
   nextState: SerializedState;
   /** Bytes to send via the bridge without additional transport framing. */
   outbound?: Uint8Array;
-  /** Side effects to handle. */
-  actions: Action[];
+  /** Internal reducer outputs for the next runtime layer. */
+  actions: InternalAction[];
 }

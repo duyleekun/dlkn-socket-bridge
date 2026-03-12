@@ -119,16 +119,7 @@ export interface BridgeSession {
   callbackKey: string;
   socketId: string;
   bridgeUrl: string;
-  authMode: TelegramAuthMode;
-  phone: string;
-  dcMode: TelegramDcMode;
   persistedSessionRef?: string;
-  pendingQrImportTokenBase64Url?: string;
-  pendingPhoneCode?: string;
-  /** QR login URL returned by login_qr_url action (displayed as QR code in UI) */
-  qrLoginUrl?: string;
-  /** QR login token expiry (unix ms) */
-  qrExpiresAt?: number;
   socketStatus: SocketStatus;
   socketLastCheckedAt?: number;
   socketLastHealthyAt?: number;

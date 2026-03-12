@@ -1,14 +1,15 @@
 /**
  * Inbound message dispatcher for the gramjs state machine.
  *
- * Receives deserialized MTProto objects and produces Actions + updated state.
+ * Receives deserialized MTProto objects and produces internal reducer outputs
+ * plus the next serialized state.
  */
 import { Api } from 'telegram/tl/index.js';
 import { RPCResult, MessageContainer, GZIPPacked } from 'telegram/tl/core/index.js';
 import { BinaryReader } from 'telegram/extensions/index.js';
 import { readBufferFromBigInt } from 'telegram/Helpers.js';
 import type { SerializedState } from '../types/state.js';
-import type { Action } from '../types/action.js';
+import type { InternalAction } from '../types/internal-action.js';
 import { parseMigrateDc } from '../dc/dc-resolver.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ const UPDATE_CLASS_NAMES = new Set([
   'UpdatesCombined',
 ]);
 
-// ── Login action detection ───────────────────────────────────────────
+// ── Login state transitions ──────────────────────────────────────────
 
 export function containsUpdateLoginToken(obj: unknown): boolean {
   if (!obj || typeof obj !== 'object') return false;
@@ -160,10 +161,10 @@ export function buildLoginActions(
   requestName: string,
   result: unknown,
   state: SerializedState,
-): { actions: Action[]; updatedState: SerializedState } | null {
+): { actions: InternalAction[]; updatedState: SerializedState } | null {
   const className = classNameOf(result);
 
-  // auth.SentCode -> login_code_sent
+  // auth.SentCode -> populate awaiting-code state
   if (className === 'auth.SentCode') {
     const sentCode = result as Record<string, unknown>;
     const phoneCodeHash = (sentCode.phoneCodeHash as string) ?? '';
@@ -176,23 +177,30 @@ export function buildLoginActions(
       phoneCodeLength: codeLength,
     };
     return {
-      actions: [{ type: 'login_code_sent', phoneCodeHash, codeLength }],
+      actions: [],
       updatedState,
     };
   }
 
-  // auth.Authorization -> login_success
+  // auth.Authorization -> authenticated READY state
   if (result instanceof Api.auth.Authorization || className === 'auth.Authorization') {
     const auth = result as Record<string, unknown>;
     const user = normalizeTlValue(auth.user) as Record<string, unknown>;
-    const updatedState: SerializedState = { ...state, phase: 'READY', user };
+    const updatedState: SerializedState = {
+      ...state,
+      phase: 'READY',
+      user,
+      pendingQrImportTokenBase64Url: undefined,
+      qrLoginUrl: undefined,
+      qrExpiresAt: undefined,
+    };
     return {
-      actions: [{ type: 'login_success', user }],
+      actions: [],
       updatedState,
     };
   }
 
-  // account.Password (response to account.GetPassword) -> login_password_needed
+  // account.Password (response to account.GetPassword) -> populate 2FA state
   if (className === 'account.Password' && requestName === 'account.GetPassword') {
     const pwd = result as Record<string, unknown>;
     const hint = (pwd.hint as string) ?? '';
@@ -216,20 +224,25 @@ export function buildLoginActions(
       passwordSrp: srpData,
     };
     return {
-      actions: [{ type: 'login_password_needed', hint, srpData }],
+      actions: [],
       updatedState,
     };
   }
 
-  // auth.LoginToken (response to auth.ExportLoginToken) -> login_qr_url
+  // auth.LoginToken (response to auth.ExportLoginToken) -> store QR metadata
   if (result instanceof Api.auth.LoginToken || className === 'auth.LoginToken') {
     const token = result as Record<string, unknown>;
     const tokenBase64 = Buffer.from(token.token as Uint8Array).toString('base64url');
     const url = `tg://login?token=${tokenBase64}`;
     const expires = ((token.expires as number) ?? 0) * 1000;
-    const updatedState: SerializedState = { ...state, phase: 'AWAITING_QR_SCAN' };
+    const updatedState: SerializedState = {
+      ...state,
+      phase: 'AWAITING_QR_SCAN',
+      qrLoginUrl: url,
+      qrExpiresAt: expires,
+    };
     return {
-      actions: [{ type: 'login_qr_url', url, expires }],
+      actions: [],
       updatedState,
     };
   }
@@ -241,9 +254,16 @@ export function buildLoginActions(
       classNameOf(authorization) === 'auth.Authorization'
     ) {
       const user = normalizeTlValue((authorization as Record<string, unknown>).user) as Record<string, unknown>;
-      const updatedState: SerializedState = { ...state, phase: 'READY', user };
+      const updatedState: SerializedState = {
+        ...state,
+        phase: 'READY',
+        user,
+        pendingQrImportTokenBase64Url: undefined,
+        qrLoginUrl: undefined,
+        qrExpiresAt: undefined,
+      };
       return {
-        actions: [{ type: 'login_success', user }],
+        actions: [],
         updatedState,
       };
     }
@@ -277,13 +297,13 @@ export function buildLoginActions(
 // ── Core dispatch ────────────────────────────────────────────────────
 
 interface DispatchResult {
-  actions: Action[];
+  actions: InternalAction[];
   updatedState: SerializedState;
 }
 
 /**
- * Recursively dispatch a single deserialized TL object, returning Actions
- * and an updated state.
+ * Recursively dispatch a single deserialized TL object, returning reducer
+ * outputs and the updated serialized state.
  */
 async function dispatchObject(
   state: SerializedState,
@@ -294,7 +314,7 @@ async function dispatchObject(
   // ── MessageContainer ─────────────────────────────────────────────
   if (isMessageContainer(object)) {
     let currentState = state;
-    const allActions: Action[] = [];
+    const allActions: InternalAction[] = [];
     for (const msg of (object as unknown as { messages: Array<{ obj: unknown; msgId: bigint; seqNo: number }> }).messages) {
       const { actions, updatedState } = await dispatchObject(currentState, msg.obj, msg.msgId, msg.seqNo);
       allActions.push(...actions);
@@ -384,7 +404,7 @@ async function dispatchObject(
   if (className === 'BadServerSalt') {
     const saltHex = bigIntSaltToHex(obj.newServerSalt);
     const updatedState: SerializedState = { ...state, serverSalt: saltHex };
-    const actions: Action[] = [
+    const actions: InternalAction[] = [
       { type: 'new_salt', salt: saltHex },
       { type: 'bad_msg', errorCode: obj.errorCode as number, badMsgId: String(obj.badMsgId) },
     ];
@@ -461,7 +481,7 @@ export async function dispatchDecodedObject(
  * @param body    Raw decrypted inner-data bytes
  * @param msgId   Server message ID
  * @param seqNo   Sequence number
- * @returns       Actions to process + updated state to persist
+ * @returns       Internal reducer outputs + updated state to persist
  */
 export async function dispatch(
   state: SerializedState,

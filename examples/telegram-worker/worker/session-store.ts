@@ -242,8 +242,8 @@ export async function persistReadySession(
   const record: PersistedTelegramSession = {
     version: 1,
     persistedSessionRef,
-    authMode: bridge.authMode,
-    phone: bridge.phone,
+    authMode: state.authMode || "qr",
+    phone: state.phone || "",
     dcMode: state.dcMode,
     dcId: state.dcId,
     dcIp: state.dcIp,
@@ -329,9 +329,6 @@ export async function rebuildSessionFromPersisted(
     callbackKey,
     socketId: bridgeResp.socket_id,
     bridgeUrl: resolvedBridgeUrl,
-    authMode: persisted.authMode,
-    phone: persisted.phone,
-    dcMode: persisted.dcMode,
     persistedSessionRef: persisted.persistedSessionRef,
     socketStatus: "unknown",
   };

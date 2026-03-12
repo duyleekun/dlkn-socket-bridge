@@ -10,6 +10,8 @@ import assert from 'node:assert/strict';
 import { generateKeyDataFromNonce, sha1 } from 'telegram/Helpers.js';
 import {
   Api,
+  advanceSession,
+  beginAuthSession,
   createInitialState,
   sendApiMethod,
   startDhExchange,
@@ -81,6 +83,42 @@ describe('createInitialState', () => {
     assert.equal(state.dcMode, 'test');
     assert.equal(state.dcIp, '1.2.3.4');
     assert.equal(state.dcPort, 80);
+  });
+
+  it('stores auth metadata in initial state', () => {
+    const state = createInitialState({
+      apiId: '1',
+      apiHash: 'h',
+      authMode: 'phone',
+      phone: '+123',
+      pendingQrImportTokenBase64Url: 'token-1',
+      qrLoginUrl: 'tg://login?token=abc',
+      qrExpiresAt: 123,
+    });
+    assert.equal(state.authMode, 'phone');
+    assert.equal(state.phone, '+123');
+    assert.equal(state.pendingQrImportTokenBase64Url, 'token-1');
+    assert.equal(state.qrLoginUrl, 'tg://login?token=abc');
+    assert.equal(state.qrExpiresAt, 123);
+  });
+});
+
+describe('beginAuthSession', () => {
+  it('embeds auth metadata and emits the first DH frame', async () => {
+    const result = await beginAuthSession({
+      apiId: '123',
+      apiHash: 'abc',
+      dcMode: 'test',
+      authMode: 'phone',
+      phone: '+15551234567',
+    });
+
+    assert.equal(result.targetDc.id, 2);
+    assert.equal(result.targetDc.ip, '149.154.167.40');
+    assert.equal(result.nextState.phase, 'PQ_SENT');
+    assert.equal(result.nextState.authMode, 'phone');
+    assert.equal(result.nextState.phone, '+15551234567');
+    assert.ok(result.outbound.length > 0);
   });
 });
 
@@ -333,6 +371,45 @@ describe('step() edge cases', () => {
   });
 });
 
+describe('advanceSession', () => {
+  it('ignores quick ack frames', async () => {
+    const state = {
+      ...createInitialState({ apiId: '1', apiHash: 'h' }),
+      phase: 'READY' as const,
+      connectionInited: true,
+      authKey: 'aa'.repeat(256),
+      authKeyId: 'bb'.repeat(8),
+      serverSalt: 'cc'.repeat(8),
+      sessionId: 'dd'.repeat(8),
+    };
+    const quickAck = new Uint8Array(4);
+    new DataView(quickAck.buffer).setUint32(0, 0x80000000, true);
+
+    const result = await advanceSession(state, quickAck);
+    assert.deepEqual(result.nextState, state);
+    assert.deepEqual(result.outbound, []);
+    assert.deepEqual(result.events, []);
+  });
+
+  it('turns negative MTProto server frames into ERROR state', async () => {
+    const state = {
+      ...createInitialState({ apiId: '1', apiHash: 'h' }),
+      phase: 'PQ_SENT' as const,
+    };
+
+    const result = await advanceSession(
+      state,
+      new Uint8Array([4, 0, 0, 0, 0x6c, 0xfe, 0xff, 0xff]),
+    );
+
+    assert.equal(result.nextState.phase, 'ERROR');
+    assert.equal(result.nextState.error?.message, 'MTProto server error: -404 during PQ_SENT');
+    assert.equal(result.nextState.error?.code, -404);
+    assert.deepEqual(result.outbound, []);
+  });
+
+});
+
 // ── login steps throw without required state ──────────────────────────────────
 
 describe('login steps', () => {
@@ -441,10 +518,10 @@ describe('QR login dispatch', () => {
     );
 
     assert.ok(result);
-    assert.equal(result?.actions[0]?.type, 'login_success');
+    assert.deepEqual(result?.actions, []);
     assert.equal(result?.updatedState.phase, 'READY');
     assert.equal(
-      (result?.actions[0] as Extract<(typeof result)['actions'][number], { type: 'login_success' }>).user.id,
+      (result?.updatedState.user as Record<string, unknown>).id,
       '1',
     );
   });

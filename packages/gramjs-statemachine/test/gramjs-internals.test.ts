@@ -17,7 +17,7 @@ import {
   stripTransportFrame,
   wrapTransportFrame,
 } from '../src/framing/intermediate-codec.js';
-import { createInitialState, step } from '../src/index.js';
+import { advanceSession, createInitialState, step } from '../src/index.js';
 import {
   aesIgeDecrypt,
   aesIgeEncrypt,
@@ -416,10 +416,55 @@ describe('GramJS internal compatibility', () => {
 
     assert.equal(result.nextState.phase, 'AWAITING_QR_SCAN');
     assert.deepEqual(result.nextState.pendingRequests, {});
-    assert.equal(result.actions[0]?.type, 'login_qr_url');
+    assert.deepEqual(result.actions, []);
     assert.equal(
-      (result.actions[0] as { url: string }).url,
+      result.nextState.qrLoginUrl,
       `tg://login?token=${qrToken.toString('base64url')}`,
     );
+  });
+
+  it('advanceSession restarts auth on the same DC for AUTH_KEY_UNREGISTERED', async () => {
+    const requestMsgId = 0x6554433221100002n;
+    const responseMsgId = 0x6554433221100004n;
+    const rpcError = new Api.RpcError({
+      errorCode: 401,
+      errorMessage: 'AUTH_KEY_UNREGISTERED',
+    });
+    const rpcErrorBytes = Buffer.from(rpcError.getBytes());
+    const rpcResultBody = Buffer.alloc(12 + rpcErrorBytes.length);
+    rpcResultBody.writeUInt32LE(RPCResult.CONSTRUCTOR_ID, 0);
+    rpcResultBody.writeBigInt64LE(requestMsgId, 4);
+    rpcErrorBytes.copy(rpcResultBody, 12);
+    const paddingLength = (16 - ((32 + rpcResultBody.length) % 16)) % 16;
+
+    const encrypted = await buildInboundServerEnvelopeWithGramJs({
+      msgId: responseMsgId,
+      seqNo: 2,
+      body: new Uint8Array(rpcResultBody),
+      padding: new Uint8Array(paddingLength),
+    });
+
+    const state = {
+      ...createSerializedSessionState(),
+      phase: 'READY' as const,
+      authMode: 'qr' as const,
+      user: { id: '1' },
+      pendingRequests: {
+        [requestMsgId.toString()]: { requestName: 'messages.GetDialogs' },
+      },
+    };
+
+    const result = await advanceSession(state, wrapTransportFrame(encrypted));
+
+    assert.equal(result.nextState.phase, 'PQ_SENT');
+    assert.equal(result.nextState.dcId, state.dcId);
+    assert.equal(result.nextState.authMode, 'qr');
+    assert.equal(result.nextState.user, undefined);
+    assert.deepEqual(result.nextState.pendingRequests, {});
+    assert.equal(result.transport?.type, 'reconnect');
+    assert.equal(result.transport?.reason, 'auth_key_unregistered');
+    assert.equal(result.transport?.dcId, state.dcId);
+    assert.ok(result.transport?.firstOutbound instanceof Uint8Array);
+    assert.deepEqual(result.events, []);
   });
 });

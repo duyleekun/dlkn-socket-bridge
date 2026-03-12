@@ -1,29 +1,34 @@
 /**
- * Main entry point for bridge callbacks after migration to gramjs-statemachine.
+ * Bridge callback handler backed by the higher-level gramjs-statemachine API.
  *
- * Replaces the 1448-line onResponse() with a thin adapter:
+ * Flow:
  *   1. Load SerializedState + BridgeSession from KV
- *   2. Call step(state, inbound) from the library
+ *   2. Call advanceSession(state, inbound)
  *   3. Persist nextState
- *   4. Send outbound bytes if present
- *   5. Dispatch each Action to handleAction()
+ *   4. Execute reconnect directive when present
+ *   5. Send outbound bytes
+ *   6. Process runtime session events
  */
 
-import { step } from "gramjs-statemachine";
-import type { SerializedState } from "gramjs-statemachine";
+import {
+  advanceSession,
+  type SerializedState,
+} from "gramjs-statemachine";
 import {
   loadBoth,
   saveSerializedState,
 } from "../session-store";
-import { sendBytes } from "../bridge-client";
-import { isQuickAck } from "../transport";
 import {
   isSocketGoneError,
   getSocketErrorStatus,
   cleanupSocket,
   markSocketState,
 } from "../socket-health";
-import { handleAction } from "./action-handler";
+import { handleSessionEvents } from "./action-handler";
+import {
+  applyReconnectDirective,
+  sendBridgeBytes,
+} from "../bridge-session";
 import type { Env } from "../types";
 
 export async function onCallback(
@@ -32,71 +37,47 @@ export async function onCallback(
   sessionKey: string,
   rawFrame: Uint8Array,
 ): Promise<void> {
-  // Quick-ack frames have no payload — ignore silently
-  if (isQuickAck(rawFrame)) {
-    console.log(`[on-callback] quick ack for ${sessionKey}, ignoring`);
-    return;
-  }
-
   const loaded = await loadBoth(env, sessionKey);
   if (!loaded) {
     console.warn(`[on-callback] no state for session ${sessionKey}`);
     return;
   }
-  const { bridge } = loaded;
-  let { state } = loaded;
-  console.debug('[on-callback] inbound frame', {
+  let { bridge } = loaded;
+  const previousState = loaded.state;
+  console.debug("[on-callback] inbound frame", {
     sessionKey,
-    phase: state.phase,
+    phase: previousState.phase,
     frameLength: rawFrame.length,
     socketId: bridge.socketId,
   });
 
-  if (state.phase === "ERROR") {
-    console.warn(`[on-callback] ignoring frame for errored session ${sessionKey}`, {
-      frameLength: rawFrame.length,
-      socketId: bridge.socketId,
-      error: state.error?.message,
-    });
-    return;
-  }
+  const result = await advanceSession(previousState, rawFrame);
+  await saveSerializedState(env, sessionKey, result.nextState);
 
   try {
-    // Check for a 4-byte MTProto server error code
-    if (rawFrame.length === 4 + 4) {
-      // transport frame: [4 len][4 payload]
-      const inner = rawFrame.slice(4);
-      if (inner.length === 4) {
-        const view = new DataView(inner.buffer, inner.byteOffset, inner.byteLength);
-        const code = view.getInt32(0, true);
-        if (code < 0) {
-          console.error('[on-callback] negative MTProto server error frame', {
-            sessionKey,
-            phase: state.phase,
-            frameLength: rawFrame.length,
-            serverErrorCode: code,
-          });
-          throw new Error(`MTProto server error: ${code} during ${state.phase}`);
-        }
-      }
+    if (result.transport?.type === "reconnect") {
+      bridge = await applyReconnectDirective(
+        env,
+        workerUrl,
+        sessionKey,
+        bridge,
+        result.transport,
+      );
+      await sendBridgeBytes(env, sessionKey, bridge, result.transport.firstOutbound);
     }
 
-    // Step the state machine
-    const result = await step(state, rawFrame);
-    state = result.nextState;
-
-    // 1. Always persist nextState first
-    await saveSerializedState(env, sessionKey, state);
-
-    // 2. Send outbound bytes if present (already framed by gramjs-statemachine)
-    if (result.outbound) {
-      await sendBridgeBytes(env, sessionKey, bridge.bridgeUrl, bridge.socketId, result.outbound);
+    for (const outbound of result.outbound) {
+      await sendBridgeBytes(env, sessionKey, bridge, outbound);
     }
 
-    // 3. Handle side-effect actions
-    for (const action of result.actions) {
-      await handleAction(env, workerUrl, sessionKey, state, bridge, action);
-    }
+    bridge = await handleSessionEvents(
+      env,
+      sessionKey,
+      previousState,
+      result.nextState,
+      bridge,
+      result.events,
+    );
   } catch (error) {
     console.error(`[on-callback] ${sessionKey} error:`, error);
     if (isSocketGoneError(error)) {
@@ -109,42 +90,17 @@ export async function onCallback(
       );
       return;
     }
-    const message = error instanceof Error ? error.message : String(error);
-    if (state.phase === "ERROR" && state.error?.message) {
-      return;
-    }
 
-    // Persist ERROR state
-    const errorState: SerializedState = {
-      ...state,
-      phase: "ERROR",
-      error: {
-        message,
-      },
-    };
-    await saveSerializedState(env, sessionKey, errorState);
-  }
-}
-
-async function sendBridgeBytes(
-  env: Env,
-  sessionKey: string,
-  bridgeUrl: string,
-  socketId: string,
-  message: Uint8Array,
-): Promise<void> {
-  try {
-    await sendBytes(bridgeUrl, socketId, message);
-  } catch (error) {
-    if (isSocketGoneError(error)) {
-      await cleanupSocket(bridgeUrl, socketId);
-      await markSocketState(
-        env,
-        sessionKey,
-        getSocketErrorStatus(error),
-        error instanceof Error ? error.message : String(error),
-      );
+    const latestState = result.nextState;
+    if (latestState.phase !== "ERROR") {
+      const errorState: SerializedState = {
+        ...latestState,
+        phase: "ERROR",
+        error: {
+          message: error instanceof Error ? error.message : String(error),
+        },
+      };
+      await saveSerializedState(env, sessionKey, errorState);
     }
-    throw error;
   }
 }

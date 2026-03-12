@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { handleAction } from "../worker/adapter/action-handler";
+import { handleSessionEvents } from "../worker/adapter/action-handler";
 import { loadPacketLog } from "../worker/runtime-store";
 import type { BridgeSession, Env } from "../worker/types";
 import type { SerializedState } from "gramjs-statemachine";
@@ -49,22 +49,21 @@ test("update packet log preserves inbound msgId and seqNo", async () => {
     callbackKey: "callback-1",
     socketId: "socket-1",
     bridgeUrl: "http://bridge.test",
-    authMode: "qr",
-    phone: "",
-    dcMode: "production",
     socketStatus: "healthy",
   };
 
-  await handleAction(env, "http://worker.test", sessionKey, state, bridge, {
-    type: "update",
-    update: {
-      className: "UpdateShort",
-      update: { className: "UpdateUserStatus" },
+  await handleSessionEvents(env, sessionKey, state, state, bridge, [
+    {
+      type: "update",
+      update: {
+        className: "UpdateShort",
+        update: { className: "UpdateUserStatus" },
+      },
+      msgId: "123456789",
+      seqNo: 7,
+      envelopeClassName: "UpdateShort",
     },
-    msgId: "123456789",
-    seqNo: 7,
-    envelopeClassName: "UpdateShort",
-  });
+  ]);
 
   const log = await loadPacketLog(env, sessionKey);
   assert.equal(log.length, 1);

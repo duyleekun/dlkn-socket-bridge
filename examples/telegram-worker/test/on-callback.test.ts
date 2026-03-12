@@ -63,9 +63,6 @@ test("onCallback persists a deterministic error state for negative MTProto frame
     callbackKey: "callback-1",
     socketId: "socket-1",
     bridgeUrl: "http://bridge.test",
-    authMode: "qr",
-    phone: "",
-    dcMode: "production",
     socketStatus: "unknown",
   };
 
@@ -108,9 +105,6 @@ test("onCallback ignores later frames once a session is already in ERROR", async
     callbackKey: "callback-2",
     socketId: "socket-2",
     bridgeUrl: "http://bridge.test",
-    authMode: "qr",
-    phone: "",
-    dcMode: "production",
     socketStatus: "unknown",
   };
 

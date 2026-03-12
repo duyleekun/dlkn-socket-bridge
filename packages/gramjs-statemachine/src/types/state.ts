@@ -68,6 +68,9 @@ export interface SerializedState {
   phoneCodeHash?: string;
   phoneCodeLength?: number;
   passwordHint?: string;
+  qrLoginUrl?: string;
+  qrExpiresAt?: number;
+  pendingQrImportTokenBase64Url?: string;
   passwordSrp?: {
     algoClass: string;
     g: number;
@@ -96,6 +99,11 @@ export function createInitialState(opts: {
   dcMode?: 'production' | 'test';
   apiId: string;
   apiHash: string;
+  authMode?: 'phone' | 'qr';
+  phone?: string;
+  qrLoginUrl?: string;
+  qrExpiresAt?: number;
+  pendingQrImportTokenBase64Url?: string;
 }): SerializedState {
   return {
     version: 1,
@@ -110,6 +118,11 @@ export function createInitialState(opts: {
     sequence: 0,
     lastMsgId: '0',
     connectionInited: false,
+    authMode: opts.authMode,
+    phone: opts.phone,
+    qrLoginUrl: opts.qrLoginUrl,
+    qrExpiresAt: opts.qrExpiresAt,
+    pendingQrImportTokenBase64Url: opts.pendingQrImportTokenBase64Url,
     pendingRequests: {},
   };
 }

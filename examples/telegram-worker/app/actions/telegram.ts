@@ -4,13 +4,15 @@ import { cookies } from "next/headers";
 import { env as cfEnv } from "cloudflare:workers";
 import {
   createSession,
-  sendBytes,
   closeSession,
 } from "../../worker/bridge-client";
 import { normalizeUrl, resolveBridgeUrl } from "../../worker/bridge-url";
 import {
+  persistStateAndSend,
+  sendBridgeBytes,
+} from "../../worker/bridge-session";
+import {
   cleanupSocket,
-  getSocketErrorStatus,
   isSocketGoneError,
   markSocketState,
   probeBridgeSocket,
@@ -18,14 +20,11 @@ import {
 import {
   Api,
   randomLong,
-  sendCode,
-  signIn,
-  checkPassword,
-  exportQrToken,
+  beginAuthSession,
+  submitAuthCode,
+  submitAuthPassword,
+  refreshQrLogin,
   sendApiMethod,
-  createInitialState,
-  startDhExchange,
-  resolveTelegramDc,
 } from "gramjs-statemachine";
 import type { ApiMethodPath, SerializedState } from "gramjs-statemachine";
 import { buildInputPeerFromConversation } from "../../worker/inbound";
@@ -47,7 +46,6 @@ import {
   loadPersistedLink,
   loadPersistedSession,
   loadSerializedState,
-  persistReadySession,
   rebuildSessionFromPersisted,
   saveBridgeSession,
   saveCallbackBinding,
@@ -110,13 +108,13 @@ function toStatusPayload(state: SerializedState, bridge: BridgeSession) {
   return {
     state: state.phase,
     phase: state.phase,
-    authMode: bridge.authMode,
-    phone: bridge.phone,
+    authMode: state.authMode,
+    phone: state.phone,
     phoneCodeHash: state.phoneCodeHash,
     phoneCodeLength: state.phoneCodeLength,
     passwordHint: state.passwordHint,
-    qrLoginUrl: bridge.qrLoginUrl,
-    qrExpiresAt: bridge.qrExpiresAt,
+    qrLoginUrl: state.qrLoginUrl,
+    qrExpiresAt: state.qrExpiresAt,
     sessionRef: bridge.persistedSessionRef,
     user: state.user,
     error: state.error?.message,
@@ -124,28 +122,6 @@ function toStatusPayload(state: SerializedState, bridge: BridgeSession) {
     socketLastCheckedAt: bridge.socketLastCheckedAt,
     socketLastHealthyAt: bridge.socketLastHealthyAt,
   };
-}
-
-async function sendBridgeBytes(
-  env: Env,
-  sessionKey: string,
-  bridge: BridgeSession,
-  bytes: Uint8Array,
-): Promise<void> {
-  try {
-    await sendBytes(resolveBridgeUrl(bridge.bridgeUrl), bridge.socketId, bytes);
-  } catch (error) {
-    if (isSocketGoneError(error)) {
-      await cleanupSocket(resolveBridgeUrl(bridge.bridgeUrl), bridge.socketId);
-      await markSocketState(
-        env,
-        sessionKey,
-        getSocketErrorStatus(error),
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-    throw error;
-  }
 }
 
 export async function startAuth(input: {
@@ -162,10 +138,14 @@ export async function startAuth(input: {
   const normalizedWorkerUrl = normalizeUrl(input.workerUrl || "");
   const sessionKey = crypto.randomUUID();
   const callbackKey = crypto.randomUUID();
-
-  // Resolve DC
-  const dcId = dcMode === "test" ? 2 : 2;
-  const resolvedDc = resolveTelegramDc(dcMode, dcId);
+  const initial = await beginAuthSession({
+    apiId: env.TELEGRAM_API_ID,
+    apiHash: env.TELEGRAM_API_HASH,
+    dcMode,
+    authMode,
+    phone: authMode === "phone" ? input.phone : undefined,
+  });
+  const resolvedDc = initial.targetDc;
 
   // Create bridge socket
   const bridgeResp = await createSession(
@@ -173,26 +153,14 @@ export async function startAuth(input: {
     `mtproto-frame://${resolvedDc.ip}:${resolvedDc.port}`,
     `${normalizedWorkerUrl}/cb/${callbackKey}`,
   );
-
-  // Build initial state and start DH exchange
-  const initialState = createInitialState({
-    dcId: resolvedDc.id,
-    dcIp: resolvedDc.ip,
-    dcPort: resolvedDc.port,
-    dcMode,
-    apiId: env.TELEGRAM_API_ID,
-    apiHash: env.TELEGRAM_API_HASH,
-  });
-
-  const dhResult = await startDhExchange(initialState);
   console.debug('[telegram.startAuth] initial DH request ready', {
     sessionKey,
     authMode,
     dcMode,
     dcId: resolvedDc.id,
     target: `${resolvedDc.ip}:${resolvedDc.port}`,
-    outboundLength: dhResult.outbound?.length ?? 0,
-    nextPhase: dhResult.nextState.phase,
+    outboundLength: initial.outbound.length,
+    nextPhase: initial.nextState.phase,
   });
 
   const bridge: BridgeSession = {
@@ -200,25 +168,22 @@ export async function startAuth(input: {
     callbackKey,
     socketId: bridgeResp.socket_id,
     bridgeUrl: resolvedBridgeUrl,
-    authMode,
-    phone: authMode === "phone" ? (input.phone || "").trim() : "",
-    dcMode,
     socketStatus: "unknown",
   };
 
   // Persist state + bridge + callback binding
   await Promise.all([
-    saveSerializedState(env, sessionKey, dhResult.nextState),
+    saveSerializedState(env, sessionKey, initial.nextState),
     saveBridgeSession(env, sessionKey, bridge),
     saveCallbackBinding(env, callbackKey, sessionKey),
   ]);
 
   // Send PQ request
-  await sendBridgeBytes(env, sessionKey, bridge, dhResult.outbound!);
+  await sendBridgeBytes(env, sessionKey, bridge, initial.outbound);
 
   return {
     sessionKey,
-    ...toStatusPayload(dhResult.nextState, bridge),
+    ...toStatusPayload(initial.nextState, bridge),
   };
 }
 
@@ -246,13 +211,14 @@ export async function submitCode(sessionKey: string, code: string) {
     return { error: "invalid_state" as const };
   }
 
-  const updatedBridge: BridgeSession = { ...bridge, pendingPhoneCode: code.trim() };
-  const result = await signIn(state, { code: code.trim() });
-  await Promise.all([
-    saveSerializedState(env, sessionKey, result.nextState),
-    saveBridgeSession(env, sessionKey, updatedBridge),
-  ]);
-  await sendBridgeBytes(env, sessionKey, updatedBridge, result.outbound!);
+  const result = await submitAuthCode(state, code);
+  await persistStateAndSend(
+    env,
+    sessionKey,
+    bridge,
+    result.nextState,
+    result.outbound!,
+  );
 
   return { phase: result.nextState.phase };
 }
@@ -268,9 +234,14 @@ export async function submitPassword(sessionKey: string, password: string) {
     return { error: "invalid_state" as const };
   }
 
-  const result = await checkPassword(state, { password });
-  await saveSerializedState(env, sessionKey, result.nextState);
-  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
+  const result = await submitAuthPassword(state, password);
+  await persistStateAndSend(
+    env,
+    sessionKey,
+    bridge,
+    result.nextState,
+    result.outbound!,
+  );
 
   return { phase: result.nextState.phase };
 }
@@ -290,9 +261,14 @@ export async function refreshQrToken(sessionKey: string) {
     return { error: "invalid_state" as const };
   }
 
-  const result = await exportQrToken(state);
-  await saveSerializedState(env, sessionKey, result.nextState);
-  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
+  const result = await refreshQrLogin(state);
+  await persistStateAndSend(
+    env,
+    sessionKey,
+    bridge,
+    result.nextState,
+    result.outbound!,
+  );
 
   return { phase: result.nextState.phase };
 }
@@ -447,16 +423,21 @@ export async function sendTelegramMethod(
   }
   const msgId = result.nextState.lastMsgId;
 
-  await Promise.all([
-    saveSerializedState(env, sessionKey, result.nextState),
-    trackPendingRequest(env, sessionKey, msgId, {
-      requestId,
-      kind: "generic",
-      method,
-      createdAt: Date.now(),
-    }),
-  ]);
-  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
+  await persistStateAndSend(
+    env,
+    sessionKey,
+    bridge,
+    result.nextState,
+    result.outbound!,
+    [
+      trackPendingRequest(env, sessionKey, msgId, {
+        requestId,
+        kind: "generic",
+        method,
+        createdAt: Date.now(),
+      }),
+    ],
+  );
 
   return { requestId };
 }
@@ -514,16 +495,21 @@ export async function refreshConversations(sessionKey: string) {
   );
   const msgId = result.nextState.lastMsgId;
 
-  await Promise.all([
-    saveSerializedState(env, sessionKey, result.nextState),
-    trackPendingRequest(env, sessionKey, msgId, {
-      requestId,
-      kind: "dialogs",
-      method: "messages.GetDialogs",
-      createdAt: Date.now(),
-    }),
-  ]);
-  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
+  await persistStateAndSend(
+    env,
+    sessionKey,
+    bridge,
+    result.nextState,
+    result.outbound!,
+    [
+      trackPendingRequest(env, sessionKey, msgId, {
+        requestId,
+        kind: "dialogs",
+        method: "messages.GetDialogs",
+        createdAt: Date.now(),
+      }),
+    ],
+  );
 
   return { requestId };
 }
@@ -560,16 +546,21 @@ export async function sendConversationMessage(
   );
   const msgId = result.nextState.lastMsgId;
 
-  await Promise.all([
-    saveSerializedState(env, sessionKey, result.nextState),
-    trackPendingRequest(env, sessionKey, msgId, {
-      requestId,
-      kind: "send_message",
-      method: "messages.SendMessage",
-      createdAt: Date.now(),
-    }),
-  ]);
-  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
+  await persistStateAndSend(
+    env,
+    sessionKey,
+    bridge,
+    result.nextState,
+    result.outbound!,
+    [
+      trackPendingRequest(env, sessionKey, msgId, {
+        requestId,
+        kind: "send_message",
+        method: "messages.SendMessage",
+        createdAt: Date.now(),
+      }),
+    ],
+  );
 
   return { requestId };
 }
