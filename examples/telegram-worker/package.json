@@ -1,0 +1,35 @@
+{
+  "name": "telegram-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "deploy": "vite build && wrangler deploy",
+    "test:mtproto": "node --import tsx --test test/*.test.ts",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "big-integer": "^1.6.52",
+    "next": "16.1.6",
+    "qrcode": "^1.5.4",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "telegram": "2.26.22"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.25.5",
+    "@cloudflare/workers-types": "^4.20260305.0",
+    "@playwright/test": "^1.58.2",
+    "@tailwindcss/postcss": "^4",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-rsc": "^0.5.21",
+    "tailwindcss": "^4",
+    "tsx": "^4.20.6",
+    "typescript": "^5",
+    "vinext": "^0.0.11",
+    "vite": "^7.3.1",
+    "wrangler": "^4.68.1"
+  }
+}

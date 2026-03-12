@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "telegram-worker",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "none",
+    "binding": "ASSETS"
+  },
+  "kv_namespaces": [
+    { "binding": "TG_KV", "id": "CREATE_ME" }
+  ]
+  // Secrets (set via `wrangler secret put`):
+  //   TELEGRAM_API_ID
+  //   TELEGRAM_API_HASH
+}
