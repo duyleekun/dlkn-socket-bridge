@@ -12,6 +12,7 @@ import { _serverKeys as gramjsServerKeys } from "telegram/crypto/RSA";
 import {
   bufferXor as gramjsBufferXor,
   generateRandomBytes as gramjsGenerateRandomBytes,
+  getByteArray as gramjsGetByteArray,
   readBigIntFromBuffer as gramjsReadBigIntFromBuffer,
   readBufferFromBigInt as gramjsReadBufferFromBigInt,
 } from "telegram/Helpers";
@@ -36,7 +37,8 @@ export function generateNonce(length: number): Uint8Array {
 
 /**
  * AES-256-IGE encryption.
- * @param data plaintext (must be padded to 16-byte blocks)
+ * Matches GramJS IGE behavior and pads with random bytes when needed.
+ * @param data plaintext
  * @param key 32-byte AES key
  * @param iv 32-byte IV (first 16 = ivPart1, second 16 = ivPart2)
  */
@@ -45,9 +47,6 @@ export function aesIgeEncrypt(
   key: Uint8Array,
   iv: Uint8Array,
 ): Uint8Array {
-  if (data.length % 16 !== 0) {
-    throw new Error(`aesIgeEncrypt: data length ${data.length} not multiple of 16`);
-  }
   return new Uint8Array(
     new IGE(Buffer.from(key), Buffer.from(iv)).encryptIge(Buffer.from(data)),
   );
@@ -272,7 +271,7 @@ export function computeGB(
   const bInt = bigIntFromBytes(b);
   const primeInt = bigIntFromBytes(dhPrime);
   const gbInt = gInt.modPow(bInt, primeInt);
-  return bigIntToBytes(gbInt, 256);
+  return new Uint8Array(gramjsGetByteArray(gbInt, false));
 }
 
 // ─── Helpers ───

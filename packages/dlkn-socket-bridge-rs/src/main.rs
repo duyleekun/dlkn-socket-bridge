@@ -29,7 +29,7 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024; // 16 MB
@@ -238,6 +238,14 @@ async fn create_socket(
         bytes: req.flush_bytes,
     };
 
+    debug!(
+        target_url = %target,
+        callback_url = %callback,
+        flush_interval_ms = ?flush.interval_ms,
+        flush_bytes = ?flush.bytes,
+        "creating socket session"
+    );
+
     let socket_id = Uuid::new_v4().to_string();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let bytes_rx = Arc::new(AtomicU64::new(0));
@@ -379,6 +387,7 @@ async fn send_socket(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "unknown socket_id"));
     };
 
+    debug!(socket_id = %id, bytes = body.len(), "received send request");
     entry
         .cmd_tx
         .send(BridgeCommand::Send(Bytes::from(body.to_vec())))
@@ -417,18 +426,35 @@ async fn delete_socket(
 }
 
 async fn post_callback_binary(http: &HttpClient, callback_url: &reqwest::Url, payload: Bytes) {
-    if let Err(err) = http
+    let payload_len = payload.len();
+    debug!(%callback_url, bytes = payload_len, "posting binary callback");
+    match http
         .post(callback_url.clone())
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .body(payload)
         .send()
         .await
     {
-        warn!(%callback_url, error = %err, "failed to post binary callback");
+        Ok(response) => {
+            debug!(
+                %callback_url,
+                bytes = payload_len,
+                status = %response.status(),
+                "binary callback completed"
+            );
+        }
+        Err(err) => {
+            warn!(%callback_url, error = %err, "failed to post binary callback");
+        }
     }
 }
 
-async fn post_callback_closed(http: &HttpClient, callback_url: &reqwest::Url, reason: &str) {
+async fn post_callback_closed(
+    http: &HttpClient,
+    callback_url: &reqwest::Url,
+    reason: &str,
+) {
+    debug!(%callback_url, reason, "posting closed callback");
     if let Err(err) = http
         .post(callback_url.clone())
         .json(&ClosedEvent {
@@ -541,6 +567,7 @@ where
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(BridgeCommand::Send(data)) => {
+                        debug!(socket_id = %_socket_id, bytes = data.len(), "stream write");
                         bytes_tx.fetch_add(data.len() as u64, Ordering::Relaxed);
                         tcp_tx.write_all(&data).await?;
                     }
@@ -555,6 +582,7 @@ where
                 if n == 0 {
                     break "remote_close";
                 }
+                debug!(socket_id = %_socket_id, bytes = n, "stream read");
                 flush_buf.extend_from_slice(&read_buf[..n]);
                 bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
                 if should_flush(&flush_buf, last_flush, &flush) {
@@ -612,6 +640,7 @@ async fn run_loco_frame_engine(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(BridgeCommand::Send(data)) => {
+                        debug!(socket_id = %socket_id, bytes = data.len(), "loco-frame write");
                         bytes_tx.fetch_add(data.len() as u64, Ordering::Relaxed);
                         tx.write_all(&data).await?;
                     }
@@ -638,6 +667,7 @@ async fn run_loco_frame_engine(
             } => {
                 match result {
                     Ok(frame) => {
+                        debug!(socket_id = %socket_id, bytes = frame.len(), "loco-frame read");
                         bytes_rx.fetch_add(frame.len() as u64, Ordering::Relaxed);
                         post_callback_binary(&state.http, &callback_url, Bytes::from(frame)).await;
                     }
@@ -686,6 +716,7 @@ async fn run_mtproto_frame_engine(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(BridgeCommand::Send(data)) => {
+                        debug!(socket_id = %socket_id, bytes = data.len(), "mtproto-frame write");
                         bytes_tx.fetch_add(data.len() as u64, Ordering::Relaxed);
                         tx.write_all(&data).await?;
                     }
@@ -702,6 +733,7 @@ async fn run_mtproto_frame_engine(
 
                 // High bit set = quick ack (4 bytes total, no payload follows)
                 if length_field & 0x80000000 != 0 {
+                    debug!(socket_id = %socket_id, ack = true, raw = length_field, "mtproto quick ack read");
                     return Ok(hdr.to_vec());
                 }
 
@@ -720,6 +752,11 @@ async fn run_mtproto_frame_engine(
             } => {
                 match result {
                     Ok(frame) => {
+                        debug!(
+                            socket_id = %socket_id,
+                            bytes = frame.len(),
+                            "mtproto-frame read"
+                        );
                         bytes_rx.fetch_add(frame.len() as u64, Ordering::Relaxed);
                         post_callback_binary(&state.http, &callback_url, Bytes::from(frame)).await;
                     }
@@ -759,6 +796,7 @@ async fn run_ws_engine(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(BridgeCommand::Send(data)) => {
+                        debug!(socket_id = %socket_id, bytes = data.len(), "websocket write");
                         bytes_tx.fetch_add(data.len() as u64, Ordering::Relaxed);
                         ws_sink.send(Message::Binary(data.to_vec())).await?;
                     }
@@ -775,11 +813,13 @@ async fn run_ws_engine(
             item = ws_stream.next() => {
                 match item {
                     Some(Ok(Message::Binary(data))) => {
+                        debug!(socket_id = %socket_id, bytes = data.len(), "websocket binary read");
                         bytes_rx.fetch_add(data.len() as u64, Ordering::Relaxed);
                         post_callback_binary(&state.http, &callback_url, Bytes::from(data)).await;
                     }
                     Some(Ok(Message::Text(text))) => {
                         let data = text.to_string().into_bytes();
+                        debug!(socket_id = %socket_id, bytes = data.len(), "websocket text read");
                         bytes_rx.fetch_add(data.len() as u64, Ordering::Relaxed);
                         post_callback_binary(&state.http, &callback_url, Bytes::from(data)).await;
                     }

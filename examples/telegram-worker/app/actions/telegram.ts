@@ -16,16 +16,26 @@ import {
   probeBridgeSocket,
 } from "../../worker/socket-health";
 import {
+  buildGetDialogs,
   buildCheckPassword,
   buildExportLoginToken,
   buildImportLoginToken,
   buildReqPqMulti,
+  buildSendMessage,
   buildSendCode,
   buildSignIn,
   buildApiMethod,
 } from "../../worker/mtproto/auth-steps";
+import { buildInputPeerFromConversation } from "../../worker/mtproto/inbound";
 import { getDefaultTelegramDc } from "../../worker/mtproto/dc";
 import {
+  clearRuntimeArtifacts,
+  loadConversationCache,
+  loadPacketLog,
+  trackPendingRequest,
+} from "../../worker/runtime-store";
+import {
+  deleteCallbackBinding,
   SESSION_COOKIE_NAME,
   decryptCookieValue,
   deletePersistedSessionArtifacts,
@@ -36,12 +46,15 @@ import {
   loadSessionState,
   rebuildSessionFromPersisted,
   saveSessionState,
+  saveCallbackBinding,
   shouldReuseRuntimeSession,
 } from "../../worker/session-store";
 import { wrapTransportFrame } from "../../worker/mtproto/transport";
 import type {
   BridgeSocketHealth,
+  ConversationCache,
   Env,
+  ParsedPacketEntry,
   SessionState,
   TelegramAuthMode,
   TelegramDcMode,
@@ -94,6 +107,7 @@ function toStatusPayload(state: SessionState) {
     state: state.state,
     authMode: state.authMode,
     phoneCodeHash: state.phoneCodeHash,
+    phoneCodeLength: state.phoneCodeLength,
     passwordHint: state.passwordHint,
     qrLoginUrl: state.qrLoginUrl,
     qrExpiresAt: state.qrExpiresAt,
@@ -132,6 +146,47 @@ async function sendSessionBytes(
   }
 }
 
+async function dispatchReadyRequest(
+  env: Env,
+  sessionKey: string,
+  request: {
+    requestId: string;
+    kind: "generic" | "dialogs" | "send_message";
+    method: string;
+  },
+  build: (state: SessionState) => {
+    sendBytes: Uint8Array;
+    stateUpdates: Partial<SessionState>;
+    msgId?: string;
+  },
+): Promise<{ requestId: string } | { error: "not_ready" }> {
+  const state = await loadSessionState(env, sessionKey);
+  if (!state || state.state !== "READY") {
+    return { error: "not_ready" as const };
+  }
+
+  const built = build(state);
+  if (!built.msgId) {
+    throw new Error(`request ${request.method} is missing outbound msgId`);
+  }
+
+  const nextState = {
+    ...state,
+    ...built.stateUpdates,
+  } as SessionState;
+
+  await Promise.all([
+    saveSessionState(env, sessionKey, nextState),
+    trackPendingRequest(env, sessionKey, built.msgId, {
+      ...request,
+      createdAt: Date.now(),
+    }),
+  ]);
+  await sendSessionBytes(env, sessionKey, nextState, built.sendBytes);
+
+  return { requestId: request.requestId };
+}
+
 export async function startAuth(input: {
   authMode: TelegramAuthMode;
   phone?: string;
@@ -146,23 +201,19 @@ export async function startAuth(input: {
   const resolvedWorkerUrl = normalizeUrl(input.workerUrl || "");
   const preset = getDefaultTelegramDc(dcMode);
   const sessionKey = crypto.randomUUID();
+  const callbackKey = crypto.randomUUID();
 
   const bridge = await createSession(
     resolvedBridgeUrl,
     `mtproto-frame://${preset.ip}:${preset.port}`,
-    `${resolvedWorkerUrl}/cb/${sessionKey}`,
+    `${resolvedWorkerUrl}/cb/${callbackKey}`,
   );
 
   const { sendBytes: pqBytes, stateUpdates } = buildReqPqMulti();
-  await sendBytes(
-    resolvedBridgeUrl,
-    bridge.socket_id,
-    wrapTransportFrame(pqBytes),
-  );
-
   const state: SessionState = {
     state: "PQ_SENT",
     authMode,
+    callbackKey,
     socketId: bridge.socket_id,
     bridgeUrl: resolvedBridgeUrl,
     phone: authMode === "phone" ? (input.phone || "").trim() : "",
@@ -175,7 +226,15 @@ export async function startAuth(input: {
     socketStatus: "unknown",
     ...stateUpdates,
   };
-  await env.TG_KV.put(`session:${sessionKey}`, JSON.stringify(state));
+  await Promise.all([
+    saveSessionState(env, sessionKey, state),
+    saveCallbackBinding(env, callbackKey, sessionKey),
+  ]);
+  await sendBytes(
+    resolvedBridgeUrl,
+    bridge.socket_id,
+    wrapTransportFrame(pqBytes),
+  );
 
   return { sessionKey, ...toStatusPayload(state) };
 }
@@ -196,6 +255,10 @@ export async function submitCode(sessionKey: string, code: string) {
   const env = getEnv();
   const state = await loadSessionState(env, sessionKey);
   if (!state || state.state !== "AWAITING_CODE") {
+    console.warn("[actions.submitCode] invalid state", {
+      sessionKey,
+      currentState: state?.state,
+    });
     return { error: "invalid_state" as const };
   }
 
@@ -204,13 +267,25 @@ export async function submitCode(sessionKey: string, code: string) {
     env.TELEGRAM_API_ID,
     code.trim(),
   );
-  await sendSessionBytes(env, sessionKey, state, signInBytes);
-
   const nextState = {
     ...state,
     ...stateUpdates,
+    pendingPhoneCode: code.trim(),
   } as SessionState;
   await saveSessionState(env, sessionKey, nextState);
+  console.log("[actions.submitCode] saved SIGN_IN_SENT", {
+    sessionKey,
+    previousState: state.state,
+    nextState: nextState.state,
+    phone: nextState.phone,
+    phoneCodeHash: nextState.phoneCodeHash,
+    phoneCodeLength: nextState.phoneCodeLength,
+  });
+  await sendSessionBytes(env, sessionKey, nextState, signInBytes);
+  console.log("[actions.submitCode] sent signIn bytes", {
+    sessionKey,
+    pendingPhoneCode: nextState.pendingPhoneCode,
+  });
 
   return { state: nextState.state };
 }
@@ -227,13 +302,12 @@ export async function submitPassword(sessionKey: string, password: string) {
     env.TELEGRAM_API_ID,
     password,
   );
-  await sendSessionBytes(env, sessionKey, state, passwordBytes);
-
   const nextState = {
     ...state,
     ...stateUpdates,
   } as SessionState;
   await saveSessionState(env, sessionKey, nextState);
+  await sendSessionBytes(env, sessionKey, nextState, passwordBytes);
 
   return { state: nextState.state };
 }
@@ -255,8 +329,6 @@ export async function refreshQrToken(sessionKey: string) {
     env.TELEGRAM_API_ID,
     env.TELEGRAM_API_HASH,
   );
-  await sendSessionBytes(env, sessionKey, state, tokenBytes);
-
   const nextState = {
     ...state,
     ...stateUpdates,
@@ -265,6 +337,7 @@ export async function refreshQrToken(sessionKey: string) {
     qrExpiresAt: undefined,
   } as SessionState;
   await saveSessionState(env, sessionKey, nextState);
+  await sendSessionBytes(env, sessionKey, nextState, tokenBytes);
 
   return { state: nextState.state };
 }
@@ -306,7 +379,11 @@ export async function restoreSessionFromCookie(
     if (link.socketId) {
       await cleanupSocket(link.bridgeUrl, link.socketId);
     }
+    if (liveState?.callbackKey) {
+      await deleteCallbackBinding(env, liveState.callbackKey);
+    }
     await deleteSessionState(env, link.liveSessionKey);
+    await clearRuntimeArtifacts(env, link.liveSessionKey);
   }
 
   const rebuilt = await rebuildSessionFromPersisted(
@@ -341,7 +418,9 @@ export async function logoutSession(sessionKey?: string) {
   }
 
   if (sessionKey) {
+    await deleteCallbackBinding(env, activeState?.callbackKey);
     await deleteSessionState(env, sessionKey);
+    await clearRuntimeArtifacts(env, sessionKey);
   }
 
   if (persistedSessionRef) {
@@ -350,7 +429,10 @@ export async function logoutSession(sessionKey?: string) {
       await cleanupSocket(link.bridgeUrl, link.socketId);
     }
     if (link?.liveSessionKey && link.liveSessionKey !== sessionKey) {
+      const linkedState = await loadSessionState(env, link.liveSessionKey);
+      await deleteCallbackBinding(env, linkedState?.callbackKey);
       await deleteSessionState(env, link.liveSessionKey);
+      await clearRuntimeArtifacts(env, link.liveSessionKey);
     }
     await deletePersistedSessionArtifacts(env, persistedSessionRef);
   }
@@ -377,28 +459,22 @@ export async function sendTelegramMethod(
   params: Record<string, unknown>,
 ) {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state || state.state !== "READY") {
-    return { error: "not_ready" as const };
-  }
-
   const requestId = crypto.randomUUID();
-  const { sendBytes: methodBytes, stateUpdates } = buildApiMethod(
-    state,
-    env.TELEGRAM_API_ID,
-    method,
-    params,
+  return dispatchReadyRequest(
+    env,
+    sessionKey,
+    {
+      requestId,
+      kind: "generic",
+      method,
+    },
+    (state) => buildApiMethod(
+      state,
+      env.TELEGRAM_API_ID,
+      method,
+      params,
+    ),
   );
-  await sendSessionBytes(env, sessionKey, state, methodBytes);
-
-  const nextState = {
-    ...state,
-    ...stateUpdates,
-    pendingRequestId: requestId,
-  } as SessionState;
-  await saveSessionState(env, sessionKey, nextState);
-
-  return { requestId };
 }
 
 export async function getResult(sessionKey: string, requestId: string) {
@@ -408,6 +484,80 @@ export async function getResult(sessionKey: string, requestId: string) {
     "json",
   );
   return result || { pending: true as const };
+}
+
+export async function getPacketLog(
+  sessionKey: string,
+): Promise<ParsedPacketEntry[] | { error: "not_found" }> {
+  const env = getEnv();
+  const state = await loadSessionState(env, sessionKey);
+  if (!state) {
+    return { error: "not_found" as const };
+  }
+  return loadPacketLog(env, sessionKey);
+}
+
+export async function getConversations(
+  sessionKey: string,
+): Promise<ConversationCache | { error: "not_found" }> {
+  const env = getEnv();
+  const state = await loadSessionState(env, sessionKey);
+  if (!state) {
+    return { error: "not_found" as const };
+  }
+  return (
+    await loadConversationCache(env, sessionKey)
+  ) || { items: [], updatedAt: 0 };
+}
+
+export async function refreshConversations(sessionKey: string) {
+  const env = getEnv();
+  const requestId = crypto.randomUUID();
+  return dispatchReadyRequest(
+    env,
+    sessionKey,
+    {
+      requestId,
+      kind: "dialogs",
+      method: "messages.GetDialogs",
+    },
+    (state) => buildGetDialogs(state, env.TELEGRAM_API_ID),
+  );
+}
+
+export async function sendConversationMessage(
+  sessionKey: string,
+  conversationId: string,
+  text: string,
+) {
+  const env = getEnv();
+  const state = await loadSessionState(env, sessionKey);
+  if (!state || state.state !== "READY") {
+    return { error: "not_ready" as const };
+  }
+
+  const cache = await loadConversationCache(env, sessionKey);
+  const conversation = cache?.items.find((item) => item.id === conversationId);
+  if (!conversation) {
+    return { error: "conversation_not_found" as const };
+  }
+
+  const requestId = crypto.randomUUID();
+  return dispatchReadyRequest(
+    env,
+    sessionKey,
+    {
+      requestId,
+      kind: "send_message",
+      method: "messages.SendMessage",
+    },
+    (latestState) => buildSendMessage(
+      latestState,
+      env.TELEGRAM_API_ID,
+      buildInputPeerFromConversation(conversation),
+      text.trim(),
+    ),
+  );
 }
 
 export async function closeCurrentSocket(sessionKey: string) {

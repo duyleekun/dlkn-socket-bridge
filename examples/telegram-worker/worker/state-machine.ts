@@ -11,9 +11,17 @@ import {
   markSocketState,
 } from "./socket-health";
 import {
+  deleteCallbackBinding,
+  loadSessionState,
   persistReadySession,
+  saveCallbackBinding,
   saveSessionState,
 } from "./session-store";
+import {
+  appendPacketLog,
+  resolvePendingRequest,
+  saveConversationCache,
+} from "./runtime-store";
 import {
   isQuickAck,
   stripTransportFrame,
@@ -27,16 +35,193 @@ import {
   buildExportLoginToken,
   buildGetPassword,
   buildImportLoginToken,
+  buildMsgsAck,
   buildReqPqMulti,
   buildSendCode,
+  buildSignIn,
+  buildSignUp,
   handleDHGenResult,
   handleResPQ,
   handleServerDHParams,
   normalizePasswordSrp,
 } from "./mtproto/auth-steps";
+import {
+  buildConversationCacheFromDialogs,
+  parseInboundObject,
+} from "./mtproto/inbound";
 import { MessageContainer, RPCResult } from "telegram/tl/core";
 import { Api } from "telegram/tl";
 import type { Env, SessionState } from "./types";
+
+const TEST_DC_SIGN_UP_PROFILE = {
+  firstName: "MTProto",
+  lastName: "Core Test",
+} as const;
+
+function normalizeLongValue(
+  value: bigint | string | number | { toString(): string },
+): bigint {
+  if (typeof value === "bigint") {
+    return value;
+  }
+  if (typeof value === "number") {
+    return BigInt(Math.trunc(value));
+  }
+  if (typeof value === "string") {
+    return BigInt(value);
+  }
+  return BigInt(value.toString());
+}
+
+function longToHex(value: bigint | string | number | { toString(): string }): string {
+  const bytes = new Uint8Array(8);
+  const view = new DataView(bytes.buffer);
+  view.setBigInt64(0, BigInt.asIntN(64, normalizeLongValue(value)), true);
+  return Buffer.from(bytes).toString("hex");
+}
+
+function computeTimeOffsetFromServerMsgId(serverMsgId: bigint): number {
+  const now = Math.floor(Date.now() / 1000);
+  const correct = Number(serverMsgId >> 32n);
+  return correct - now;
+}
+
+function applyNewSessionCreatedState(
+  state: SessionState,
+  value: unknown,
+): SessionState {
+  if (value instanceof Api.NewSessionCreated) {
+    return {
+      ...state,
+      serverSalt: longToHex(value.serverSalt),
+    };
+  }
+
+  if (value instanceof MessageContainer) {
+    return value.messages.reduce(
+      (currentState, message) => applyNewSessionCreatedState(currentState, message.obj),
+      state,
+    );
+  }
+
+  if (value instanceof RPCResult) {
+    if (value.body instanceof Uint8Array || Buffer.isBuffer(value.body)) {
+      return state;
+    }
+    return applyNewSessionCreatedState(state, value.body);
+  }
+
+  const typed = value as {
+    className?: string;
+    serverSalt?: bigint | string | number;
+    body?: unknown;
+    obj?: unknown;
+    messages?: Array<{ obj?: unknown; body?: unknown }>;
+  } | null;
+  if (!typed || typeof typed !== "object") {
+    return state;
+  }
+
+  if (typed.className === "NewSessionCreated" && typed.serverSalt !== undefined) {
+    return {
+      ...state,
+      serverSalt: longToHex(typed.serverSalt),
+    };
+  }
+
+  if (Array.isArray(typed.messages)) {
+    return typed.messages.reduce((currentState, message) => {
+      return applyNewSessionCreatedState(
+        currentState,
+        message.obj ?? message.body,
+      );
+    }, state);
+  }
+
+  if (typed.obj !== undefined) {
+    return applyNewSessionCreatedState(state, typed.obj);
+  }
+  if (typed.body !== undefined) {
+    return applyNewSessionCreatedState(state, typed.body);
+  }
+
+  return state;
+}
+
+async function deserializeEncryptedResponse(
+  env: Env,
+  sessionKey: string,
+  state: SessionState,
+  payload: Uint8Array,
+): Promise<{
+  decrypted: ReturnType<typeof decryptMessage>;
+  response: unknown;
+  state: SessionState;
+}> {
+  const decrypted = decryptMessage(state.authKey!, payload);
+  const response = await deserializeTLResponse(decrypted.body);
+  const nextState = applyNewSessionCreatedState(state, response);
+  if (nextState.serverSalt !== state.serverSalt) {
+    await saveState(env, sessionKey, nextState);
+  }
+  return {
+    decrypted,
+    response,
+    state: nextState,
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function maybeRefreshStaleAwaitingCodeState(
+  env: Env,
+  sessionKey: string,
+  state: SessionState,
+  rawFrame: Uint8Array,
+): Promise<SessionState> {
+  if (state.state !== "AWAITING_CODE" || !state.authKey) {
+    return state;
+  }
+
+  let innerResult: unknown;
+  try {
+    const payload = stripTransportFrame(rawFrame);
+    if (payload.length <= 4) {
+      return state;
+    }
+    const decrypted = decryptMessage(state.authKey, payload);
+    const response = await deserializeTLResponse(decrypted.body);
+    innerResult = await unwrapRpcResult(response);
+  } catch {
+    return state;
+  }
+
+  const className = (innerResult as { className?: string } | null)?.className;
+  if (
+    className !== "BadMsgNotification" &&
+    className !== "RpcError" &&
+    className !== "auth.Authorization" &&
+    className !== "auth.AuthorizationSignUpRequired"
+  ) {
+    return state;
+  }
+
+  for (const delay of [10, 50, 150]) {
+    await sleep(delay);
+    const refreshed = await loadSessionState(env, sessionKey);
+    if (refreshed && refreshed.state !== state.state) {
+      console.log(
+        `[state-machine] ${sessionKey}: refreshed stale ${state.state} state to ${refreshed.state}`,
+        { responseClassName: className },
+      );
+      return refreshed;
+    }
+  }
+
+  return state;
+}
 
 async function saveState(
   env: Env,
@@ -44,6 +229,40 @@ async function saveState(
   state: SessionState,
 ): Promise<void> {
   await saveSessionState(env, sessionKey, state);
+}
+
+function latestMsgId(
+  left?: string,
+  right?: string,
+): string | undefined {
+  if (!left) {
+    return right;
+  }
+  if (!right) {
+    return left;
+  }
+  return BigInt(left) >= BigInt(right) ? left : right;
+}
+
+async function saveReadyTransportState(
+  env: Env,
+  sessionKey: string,
+  state: SessionState,
+): Promise<SessionState> {
+  const current = await loadSessionState(env, sessionKey);
+  if (!current || current.state !== "READY") {
+    await saveState(env, sessionKey, state);
+    return state;
+  }
+
+  const merged = {
+    ...current,
+    ...state,
+    seqNo: Math.max(current.seqNo, state.seqNo),
+    lastMsgId: latestMsgId(current.lastMsgId, state.lastMsgId),
+  } as SessionState;
+  await saveState(env, sessionKey, merged);
+  return merged;
 }
 
 async function sendFramed(
@@ -67,6 +286,44 @@ async function sendFramed(
     }
     throw error;
   }
+}
+
+async function saveRequestResult(
+  env: Env,
+  sessionKey: string,
+  requestId: string,
+  result: Record<string, unknown>,
+): Promise<void> {
+  await env.TG_KV.put(
+    `result:${sessionKey}:${requestId}`,
+    JSON.stringify(result),
+    { expirationTtl: 300 },
+  );
+}
+
+async function resolvePendingRequestError(
+  env: Env,
+  sessionKey: string,
+  badMsgId: string,
+  error: {
+    className: string;
+    errorCode: number;
+    payload?: Record<string, unknown>;
+  },
+): Promise<void> {
+  const request = await resolvePendingRequest(env, sessionKey, badMsgId);
+  if (!request) {
+    return;
+  }
+  await saveRequestResult(env, sessionKey, request.requestId, {
+    requestId: request.requestId,
+    kind: request.kind,
+    method: request.method,
+    error: `${request.method} ${error.className} ${error.errorCode}`,
+    className: error.className,
+    payload: error.payload,
+    receivedAt: Date.now(),
+  });
 }
 
 function getMigrateDc(error: Api.RpcError): number | undefined {
@@ -140,15 +397,17 @@ async function restartAuthOnDc(
   overrides: Partial<SessionState> = {},
 ): Promise<void> {
   const bridgeUrl = resolveBridgeUrl(state.bridgeUrl);
+  const callbackKey = crypto.randomUUID();
   const bridge = await createSession(
     bridgeUrl,
     `mtproto-frame://${ipAddress}:${port}`,
-    `${normalizeUrl(workerUrl)}/cb/${sessionKey}`,
+    `${normalizeUrl(workerUrl)}/cb/${callbackKey}`,
   );
   const { sendBytes: pqBytes, stateUpdates } = buildReqPqMulti();
   const nextState: SessionState = {
     state: "PQ_SENT",
     authMode: state.authMode,
+    callbackKey,
     socketId: bridge.socket_id,
     bridgeUrl,
     phone: state.phone,
@@ -159,9 +418,9 @@ async function restartAuthOnDc(
     migrateToDc: undefined,
     seqNo: 0,
     timeOffset: 0,
-    pendingRequestId: undefined,
     phoneCodeHash: undefined,
     connectionInited: undefined,
+    pendingPhoneCode: undefined,
     passwordHint: undefined,
     passwordSrp: undefined,
     qrLoginUrl: undefined,
@@ -177,7 +436,11 @@ async function restartAuthOnDc(
     ...overrides,
   };
 
-  await saveState(env, sessionKey, nextState);
+  await Promise.all([
+    saveState(env, sessionKey, nextState),
+    saveCallbackBinding(env, callbackKey, sessionKey),
+    deleteCallbackBinding(env, state.callbackKey),
+  ]);
   await sendFramed(env, sessionKey, nextState, pqBytes);
   await cleanupSocket(bridgeUrl, state.socketId);
   console.log(
@@ -197,10 +460,168 @@ async function requestPasswordInfo(
   const nextState = {
     ...state,
     ...stateUpdates,
+    pendingPhoneCode: undefined,
     error: undefined,
   } as SessionState;
   await saveState(env, sessionKey, nextState);
   await sendFramed(env, sessionKey, state, passwordBytes);
+}
+
+async function retrySignInWithNewServerSalt(
+  env: Env,
+  sessionKey: string,
+  state: SessionState,
+  response: InstanceType<typeof Api.BadServerSalt>,
+): Promise<void> {
+  if (!state.pendingPhoneCode) {
+    throw new Error("cannot retry signIn without the submitted phone code");
+  }
+
+  const retryState = {
+    ...state,
+    serverSalt: longToHex(response.newServerSalt),
+    error: undefined,
+  } as SessionState;
+  const { sendBytes: signInBytes, stateUpdates } = buildSignIn(
+    retryState,
+    env.TELEGRAM_API_ID,
+    state.pendingPhoneCode,
+  );
+  const nextState = {
+    ...retryState,
+    ...stateUpdates,
+  } as SessionState;
+  await saveState(env, sessionKey, nextState);
+  await sendFramed(env, sessionKey, retryState, signInBytes);
+}
+
+async function retrySignUpWithNewServerSalt(
+  env: Env,
+  sessionKey: string,
+  state: SessionState,
+  response: InstanceType<typeof Api.BadServerSalt>,
+): Promise<void> {
+  const retryState = {
+    ...state,
+    serverSalt: longToHex(response.newServerSalt),
+    error: undefined,
+  } as SessionState;
+  const { sendBytes: signUpBytes, stateUpdates } = buildSignUp(
+    retryState,
+    env.TELEGRAM_API_ID,
+    TEST_DC_SIGN_UP_PROFILE.firstName,
+    TEST_DC_SIGN_UP_PROFILE.lastName,
+  );
+  const nextState = {
+    ...retryState,
+    ...stateUpdates,
+  } as SessionState;
+  await saveState(env, sessionKey, nextState);
+  await sendFramed(env, sessionKey, retryState, signUpBytes);
+}
+
+function recoverFromBadMessage(
+  state: SessionState,
+  response: InstanceType<typeof Api.BadMsgNotification>,
+  serverMsgId: bigint,
+): SessionState | null {
+  switch (response.errorCode) {
+    case 16:
+    case 17:
+      return {
+        ...state,
+        timeOffset: computeTimeOffsetFromServerMsgId(serverMsgId),
+        lastMsgId: undefined,
+        error: undefined,
+      };
+    case 32:
+      return {
+        ...state,
+        seqNo: state.seqNo + 64,
+        lastMsgId: undefined,
+        error: undefined,
+      };
+    case 33:
+      return {
+        ...state,
+        seqNo: Math.max(0, state.seqNo - 16),
+        lastMsgId: undefined,
+        error: undefined,
+      };
+    default:
+      return null;
+  }
+}
+
+async function retrySignInWithBadMsgNotification(
+  env: Env,
+  sessionKey: string,
+  state: SessionState,
+  response: InstanceType<typeof Api.BadMsgNotification>,
+  serverMsgId: bigint,
+): Promise<boolean> {
+  if (!state.pendingPhoneCode) {
+    throw new Error("cannot retry signIn without the submitted phone code");
+  }
+
+  const retryState = recoverFromBadMessage(state, response, serverMsgId);
+  if (!retryState) {
+    return false;
+  }
+
+  const { sendBytes: signInBytes, stateUpdates } = buildSignIn(
+    retryState,
+    env.TELEGRAM_API_ID,
+    state.pendingPhoneCode,
+  );
+  const nextState = {
+    ...retryState,
+    ...stateUpdates,
+  } as SessionState;
+  await saveState(env, sessionKey, nextState);
+  await sendFramed(env, sessionKey, retryState, signInBytes);
+  console.log(`[state-machine] ${sessionKey}: retrying signIn after bad msg`, {
+    errorCode: response.errorCode,
+    badMsgId: response.badMsgId.toString(),
+    serverMsgId: serverMsgId.toString(),
+    timeOffset: nextState.timeOffset,
+    seqNo: nextState.seqNo,
+  });
+  return true;
+}
+
+async function retrySignUpWithBadMsgNotification(
+  env: Env,
+  sessionKey: string,
+  state: SessionState,
+  response: InstanceType<typeof Api.BadMsgNotification>,
+  serverMsgId: bigint,
+): Promise<boolean> {
+  const retryState = recoverFromBadMessage(state, response, serverMsgId);
+  if (!retryState) {
+    return false;
+  }
+
+  const { sendBytes: signUpBytes, stateUpdates } = buildSignUp(
+    retryState,
+    env.TELEGRAM_API_ID,
+    TEST_DC_SIGN_UP_PROFILE.firstName,
+    TEST_DC_SIGN_UP_PROFILE.lastName,
+  );
+  const nextState = {
+    ...retryState,
+    ...stateUpdates,
+  } as SessionState;
+  await saveState(env, sessionKey, nextState);
+  await sendFramed(env, sessionKey, retryState, signUpBytes);
+  console.log(`[state-machine] ${sessionKey}: retrying signUp after bad msg`, {
+    errorCode: response.errorCode,
+    badMsgId: response.badMsgId.toString(),
+    serverMsgId: serverMsgId.toString(),
+    timeOffset: nextState.timeOffset,
+    seqNo: nextState.seqNo,
+  });
+  return true;
 }
 
 async function startPostAuthFlow(
@@ -260,6 +681,7 @@ async function finalizeReadyState(
     user,
     error: undefined,
     phoneCodeHash: undefined,
+    pendingPhoneCode: undefined,
     passwordHint: undefined,
     passwordSrp: undefined,
     qrLoginUrl: undefined,
@@ -339,10 +761,28 @@ async function handleAuthorizationResult(
     innerResult &&
     (innerResult as { className?: string }).className === "auth.AuthorizationSignUpRequired"
   ) {
+    if (state.dcMode === "test") {
+      // Test DC numbers may require an immediate auth.signUp after auth.signIn.
+      const { sendBytes: signUpBytes, stateUpdates } = buildSignUp(
+        state,
+        env.TELEGRAM_API_ID,
+        TEST_DC_SIGN_UP_PROFILE.firstName,
+        TEST_DC_SIGN_UP_PROFILE.lastName,
+      );
+      const nextState = {
+        ...state,
+        ...stateUpdates,
+        error: undefined,
+      } as SessionState;
+      await saveState(env, sessionKey, nextState);
+      await sendFramed(env, sessionKey, state, signUpBytes);
+      console.log(`[state-machine] ${sessionKey}: ${source} → SIGN_UP_SENT`);
+      return true;
+    }
     await saveState(env, sessionKey, {
       ...state,
       state: "ERROR",
-      error: "sign-up required auth flow is not implemented",
+      error: "sign-up is only supported for test DC sessions",
     });
     return true;
   }
@@ -444,7 +884,7 @@ export async function onResponse(
   sessionKey: string,
   rawFrame: Uint8Array,
 ): Promise<void> {
-  const state = await env.TG_KV.get<SessionState>(`session:${sessionKey}`, "json");
+  let state = await loadSessionState(env, sessionKey);
   if (!state) {
     console.warn(`[state-machine] no state for session ${sessionKey}`);
     return;
@@ -456,6 +896,12 @@ export async function onResponse(
   }
 
   try {
+    state = await maybeRefreshStaleAwaitingCodeState(
+      env,
+      sessionKey,
+      state,
+      rawFrame,
+    );
     const payload = stripTransportFrame(rawFrame);
 
     if (payload.length === 4) {
@@ -505,22 +951,36 @@ export async function onResponse(
       }
 
       case "CODE_SENT": {
-        const { body } = decryptMessage(state.authKey!, payload);
-        const response = await deserializeTLResponse(body);
+        const { response, state: hydratedState } = await deserializeEncryptedResponse(
+          env,
+          sessionKey,
+          state,
+          payload,
+        );
         const innerResult = await unwrapRpcResult(response);
 
         if (innerResult && (innerResult as { className?: string }).className === "auth.SentCode") {
-          const sentCode = innerResult as { phoneCodeHash?: string };
+          const sentCode = innerResult as {
+            phoneCodeHash?: string;
+            type?: { className?: string; length?: number };
+          };
+          console.log(`[state-machine] ${sessionKey}: auth.sendCode completed`, {
+            phone: hydratedState.phone,
+            phoneCodeHash: sentCode.phoneCodeHash || "",
+            sentCodeType: sentCode.type?.className,
+            sentCodeLength: sentCode.type?.length,
+          });
           await saveState(env, sessionKey, {
-            ...state,
+            ...hydratedState,
             state: "AWAITING_CODE",
             phoneCodeHash: sentCode.phoneCodeHash || "",
+            phoneCodeLength: sentCode.type?.length,
             error: undefined,
           });
         } else if (innerResult instanceof Api.RpcError) {
-          if (!(await requestDcMigrationConfig(env, sessionKey, state, innerResult))) {
+          if (!(await requestDcMigrationConfig(env, sessionKey, hydratedState, innerResult))) {
             await saveState(env, sessionKey, {
-              ...state,
+              ...hydratedState,
               state: "ERROR",
               error: `sendCode RPC error ${innerResult.errorCode}: ${innerResult.errorMessage}`,
             });
@@ -530,13 +990,17 @@ export async function onResponse(
       }
 
       case "MIGRATE_CONFIG_SENT": {
-        const { body } = decryptMessage(state.authKey!, payload);
-        const response = await deserializeTLResponse(body);
+        const { response, state: hydratedState } = await deserializeEncryptedResponse(
+          env,
+          sessionKey,
+          state,
+          payload,
+        );
         const innerResult = await unwrapRpcResult(response);
 
         if (innerResult instanceof Api.RpcError) {
           await saveState(env, sessionKey, {
-            ...state,
+            ...hydratedState,
             state: "ERROR",
             error: `getConfig RPC error ${innerResult.errorCode}: ${innerResult.errorMessage}`,
           });
@@ -547,52 +1011,82 @@ export async function onResponse(
           className?: string;
           dcOptions?: DcOptionLike[];
         };
-        if (config.className !== "Config" || !state.migrateToDc) {
+        if (config.className !== "Config" || !hydratedState.migrateToDc) {
           await saveState(env, sessionKey, {
-            ...state,
+            ...hydratedState,
             state: "ERROR",
             error: "unexpected response while resolving migrated DC",
           });
           break;
         }
 
-        const dcOption = pickDcOption(config.dcOptions || [], state.migrateToDc);
+        const dcOption = pickDcOption(config.dcOptions || [], hydratedState.migrateToDc);
         const resolvedDc = dcOption?.ipAddress
           ? {
-              id: state.migrateToDc,
+              id: hydratedState.migrateToDc,
               ip: dcOption.ipAddress,
               port: dcOption.port || 443,
             }
-          : resolveTelegramDc(state.dcMode, state.migrateToDc);
+          : resolveTelegramDc(hydratedState.dcMode, hydratedState.migrateToDc);
 
         await restartAuthOnDc(
           env,
           workerUrl,
           sessionKey,
-          state,
+          hydratedState,
           resolvedDc.id,
           resolvedDc.ip,
           resolvedDc.port,
           {
-            pendingQrImportTokenBase64Url: state.pendingQrImportTokenBase64Url,
+            pendingQrImportTokenBase64Url: hydratedState.pendingQrImportTokenBase64Url,
           },
         );
         break;
       }
 
       case "SIGN_IN_SENT": {
-        const { body } = decryptMessage(state.authKey!, payload);
-        const response = await deserializeTLResponse(body);
+        const {
+          decrypted,
+          response,
+          state: hydratedState,
+        } = await deserializeEncryptedResponse(env, sessionKey, state, payload);
         const innerResult = await unwrapRpcResult(response);
+        console.log(`[state-machine] ${sessionKey}: SIGN_IN_SENT received`, {
+          className: (innerResult as { className?: string } | null)?.className,
+          pendingPhoneCode: Boolean(hydratedState.pendingPhoneCode),
+        });
 
-        if (await handleAuthorizationResult(env, sessionKey, state, innerResult, "SIGN_IN_SENT")) {
+        if (innerResult instanceof Api.BadServerSalt) {
+          await retrySignInWithNewServerSalt(env, sessionKey, hydratedState, innerResult);
+          break;
+        }
+
+        if (innerResult instanceof Api.BadMsgNotification) {
+          if (await retrySignInWithBadMsgNotification(
+            env,
+            sessionKey,
+            hydratedState,
+            innerResult,
+            decrypted.msgId,
+          )) {
+            break;
+          }
+          await saveState(env, sessionKey, {
+            ...hydratedState,
+            state: "ERROR",
+            error: `signIn bad_msg_notification ${innerResult.errorCode}`,
+          });
+          break;
+        }
+
+        if (await handleAuthorizationResult(env, sessionKey, hydratedState, innerResult, "SIGN_IN_SENT")) {
           break;
         }
 
         if (innerResult instanceof Api.RpcError) {
-          if (!(await requestDcMigrationConfig(env, sessionKey, state, innerResult))) {
+          if (!(await requestDcMigrationConfig(env, sessionKey, hydratedState, innerResult))) {
             await saveState(env, sessionKey, {
-              ...state,
+              ...hydratedState,
               state: "ERROR",
               error: `signIn RPC error ${innerResult.errorCode}: ${innerResult.errorMessage}`,
             });
@@ -601,9 +1095,58 @@ export async function onResponse(
         break;
       }
 
+      case "SIGN_UP_SENT": {
+        const {
+          decrypted,
+          response,
+          state: hydratedState,
+        } = await deserializeEncryptedResponse(env, sessionKey, state, payload);
+        const innerResult = await unwrapRpcResult(response);
+
+        if (innerResult instanceof Api.BadServerSalt) {
+          await retrySignUpWithNewServerSalt(env, sessionKey, hydratedState, innerResult);
+          break;
+        }
+
+        if (innerResult instanceof Api.BadMsgNotification) {
+          if (await retrySignUpWithBadMsgNotification(
+            env,
+            sessionKey,
+            hydratedState,
+            innerResult,
+            decrypted.msgId,
+          )) {
+            break;
+          }
+          await saveState(env, sessionKey, {
+            ...hydratedState,
+            state: "ERROR",
+            error: `signUp bad_msg_notification ${innerResult.errorCode}`,
+          });
+          break;
+        }
+
+        if (await handleAuthorizationResult(env, sessionKey, hydratedState, innerResult, "SIGN_UP_SENT")) {
+          break;
+        }
+
+        if (innerResult instanceof Api.RpcError) {
+          await saveState(env, sessionKey, {
+            ...hydratedState,
+            state: "ERROR",
+            error: `signUp RPC error ${innerResult.errorCode}: ${innerResult.errorMessage}`,
+          });
+        }
+        break;
+      }
+
       case "PASSWORD_INFO_SENT": {
-        const { body } = decryptMessage(state.authKey!, payload);
-        const response = await deserializeTLResponse(body);
+        const { response, state: hydratedState } = await deserializeEncryptedResponse(
+          env,
+          sessionKey,
+          state,
+          payload,
+        );
         const innerResult = await unwrapRpcResult(response);
 
         if (innerResult && (innerResult as { className?: string }).className === "account.Password") {
@@ -612,14 +1155,14 @@ export async function onResponse(
           );
           if (!passwordInfo.passwordSrp) {
             await saveState(env, sessionKey, {
-              ...state,
+              ...hydratedState,
               state: "ERROR",
               error: "unsupported Telegram password challenge",
             });
             break;
           }
           await saveState(env, sessionKey, {
-            ...state,
+            ...hydratedState,
             state: "AWAITING_PASSWORD",
             passwordHint: passwordInfo.passwordHint,
             passwordSrp: passwordInfo.passwordSrp,
@@ -627,7 +1170,7 @@ export async function onResponse(
           });
         } else if (innerResult instanceof Api.RpcError) {
           await saveState(env, sessionKey, {
-            ...state,
+            ...hydratedState,
             state: "ERROR",
             error: `getPassword RPC error ${innerResult.errorCode}: ${innerResult.errorMessage}`,
           });
@@ -636,17 +1179,21 @@ export async function onResponse(
       }
 
       case "CHECK_PASSWORD_SENT": {
-        const { body } = decryptMessage(state.authKey!, payload);
-        const response = await deserializeTLResponse(body);
+        const { response, state: hydratedState } = await deserializeEncryptedResponse(
+          env,
+          sessionKey,
+          state,
+          payload,
+        );
         const innerResult = await unwrapRpcResult(response);
 
-        if (await handleAuthorizationResult(env, sessionKey, state, innerResult, "CHECK_PASSWORD_SENT")) {
+        if (await handleAuthorizationResult(env, sessionKey, hydratedState, innerResult, "CHECK_PASSWORD_SENT")) {
           break;
         }
 
         if (innerResult instanceof Api.RpcError) {
           await saveState(env, sessionKey, {
-            ...state,
+            ...hydratedState,
             state: "ERROR",
             error: `checkPassword RPC error ${innerResult.errorCode}: ${innerResult.errorMessage}`,
           });
@@ -656,12 +1203,16 @@ export async function onResponse(
 
       case "QR_TOKEN_SENT":
       case "QR_IMPORT_SENT": {
-        const { body } = decryptMessage(state.authKey!, payload);
-        const response = await deserializeTLResponse(body);
+        const { response, state: hydratedState } = await deserializeEncryptedResponse(
+          env,
+          sessionKey,
+          state,
+          payload,
+        );
         const innerResult = await unwrapRpcResult(response);
-        if (!(await handleQrResponse(env, workerUrl, sessionKey, state, innerResult))) {
+        if (!(await handleQrResponse(env, workerUrl, sessionKey, hydratedState, innerResult))) {
           await saveState(env, sessionKey, {
-            ...state,
+            ...hydratedState,
             state: "ERROR",
             error: "unexpected QR auth response",
           });
@@ -670,17 +1221,21 @@ export async function onResponse(
       }
 
       case "AWAITING_QR_SCAN": {
-        const { body } = decryptMessage(state.authKey!, payload);
-        const response = await deserializeTLResponse(body);
+        const { response, state: hydratedState } = await deserializeEncryptedResponse(
+          env,
+          sessionKey,
+          state,
+          payload,
+        );
         if (containsUpdateLoginToken(response)) {
           const { sendBytes: tokenBytes, stateUpdates } = buildExportLoginToken(
-            state,
+            hydratedState,
             env.TELEGRAM_API_ID,
             env.TELEGRAM_API_HASH,
           );
-          const nextState = { ...state, ...stateUpdates } as SessionState;
+          const nextState = { ...hydratedState, ...stateUpdates } as SessionState;
           await saveState(env, sessionKey, nextState);
-          await sendFramed(env, sessionKey, state, tokenBytes);
+          await sendFramed(env, sessionKey, hydratedState, tokenBytes);
         } else {
           console.log(
             `[state-machine] ${sessionKey}: ignoring update while awaiting QR scan`,
@@ -690,25 +1245,111 @@ export async function onResponse(
       }
 
       case "READY": {
-        const { body } = decryptMessage(state.authKey!, payload);
-        const response = await deserializeTLResponse(body);
-        const innerResult = await unwrapRpcResult(response);
+        const {
+          decrypted,
+          response,
+          state: hydratedState,
+        } = await deserializeEncryptedResponse(env, sessionKey, state, payload);
+        const parsed = await parseInboundObject(
+          response,
+          decrypted.msgId.toString(),
+          decrypted.seqNo,
+          Date.now(),
+        );
 
-        if (state.pendingRequestId) {
-          await env.TG_KV.put(
-            `result:${sessionKey}:${state.pendingRequestId}`,
-            JSON.stringify(innerResult),
-            { expirationTtl: 300 },
+        await appendPacketLog(env, sessionKey, parsed.entries);
+
+        if (response instanceof Api.BadMsgNotification) {
+          const recoveredState = recoverFromBadMessage(
+            hydratedState,
+            response,
+            decrypted.msgId,
           );
-          await saveState(env, sessionKey, {
-            ...state,
-            pendingRequestId: undefined,
-          });
+          if (recoveredState) {
+            await saveReadyTransportState(env, sessionKey, recoveredState);
+            console.log(`[state-machine] ${sessionKey}: recovered READY session after bad msg`, {
+              errorCode: response.errorCode,
+              badMsgId: response.badMsgId.toString(),
+              seqNo: recoveredState.seqNo,
+              timeOffset: recoveredState.timeOffset,
+            });
+          }
+          await resolvePendingRequestError(
+            env,
+            sessionKey,
+            response.badMsgId.toString(),
+            {
+              className: response.className,
+              errorCode: response.errorCode,
+              payload: {
+                badMsgId: response.badMsgId.toString(),
+                badMsgSeqno: response.badMsgSeqno,
+              },
+            },
+          );
+        }
+
+        for (const rpcResult of parsed.rpcResults) {
+          const request = await resolvePendingRequest(
+            env,
+            sessionKey,
+            rpcResult.reqMsgId,
+          );
+          if (request) {
+            await saveRequestResult(env, sessionKey, request.requestId, {
+              requestId: request.requestId,
+              kind: request.kind,
+              method: request.method,
+              reqMsgId: rpcResult.reqMsgId,
+              className: rpcResult.className,
+              payload: rpcResult.payload,
+              receivedAt: Date.now(),
+            });
+          }
+
+          const conversationCache = buildConversationCacheFromDialogs(
+            rpcResult.raw,
+          );
+          if (conversationCache) {
+            await saveConversationCache(env, sessionKey, conversationCache);
+          }
+        }
+
+        const ackMsgIds = [...new Set(parsed.ackMsgIds)];
+        if (ackMsgIds.length > 0) {
+          const { sendBytes: ackBytes, stateUpdates } = buildMsgsAck(
+            hydratedState,
+            env.TELEGRAM_API_ID,
+            ackMsgIds.map((msgId) => BigInt(msgId)),
+          );
+          const nextState = {
+            ...hydratedState,
+            ...stateUpdates,
+          } as SessionState;
+          await saveReadyTransportState(env, sessionKey, nextState);
+          await sendFramed(env, sessionKey, hydratedState, ackBytes);
         }
         break;
       }
 
       case "AWAITING_CODE":
+      {
+        const { decrypted, response } = await deserializeEncryptedResponse(
+          env,
+          sessionKey,
+          state,
+          payload,
+        );
+        const inner = await unwrapRpcResult(response);
+        console.log(
+          `[state-machine] ${sessionKey}: ignoring data in AWAITING_CODE state`,
+          {
+            className: (inner as { className?: string } | null)?.className,
+            serverMsgId: decrypted.msgId.toString(),
+          },
+        );
+        break;
+      }
       case "AWAITING_PASSWORD":
       case "ERROR":
         console.log(

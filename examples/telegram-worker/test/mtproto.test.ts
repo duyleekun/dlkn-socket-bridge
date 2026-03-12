@@ -5,6 +5,7 @@ import {
   aesIgeDecrypt,
   aesIgeEncrypt,
   concatBytes,
+  computeGB,
   fingerprintToHex,
   fromHex,
   KNOWN_RSA_FINGERPRINTS,
@@ -86,6 +87,24 @@ test("AES-IGE wrapper matches GramJS IGE", () => {
   assert.deepEqual(encrypted, gramjsAesIgeEncrypt(plain, key, iv));
   assert.deepEqual(aesIgeDecrypt(encrypted, key, iv), plain);
   assert.deepEqual(gramjsAesIgeDecrypt(encrypted, key, iv), plain);
+});
+
+test("AES-IGE wrapper matches GramJS padding for unaligned plaintext", () => {
+  const key = hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+  const iv = hex("00112233445566778899aabbccddeeffffeeddccbbaa99887766554433221100");
+  const plain = hex("000102030405060708090a0b0c0d0e0f1011121314");
+
+  const encrypted = aesIgeEncrypt(plain, key, iv);
+  assert.equal(encrypted.length % 16, 0);
+  assert.equal(encrypted.length, 32);
+});
+
+test("computeGB uses minimal unsigned bytes like GramJS", () => {
+  const g = 2;
+  const b = hex("02");
+  const dhPrime = hex("17");
+
+  assert.deepEqual(computeGB(g, b, dhPrime), hex("04"));
 });
 
 test("PQInnerData serialization matches GramJS oracle", () => {

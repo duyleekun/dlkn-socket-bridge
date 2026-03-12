@@ -3,10 +3,14 @@
 import QRCode from "qrcode";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  getConversations,
   getBridgeSocketHealth,
+  getPacketLog,
   getResult,
   getStatus,
   logoutSession,
+  refreshConversations,
+  sendConversationMessage,
   refreshQrToken,
   restoreSessionFromCookie,
   sendTelegramMethod,
@@ -17,6 +21,8 @@ import {
 import { DEFAULT_BRIDGE_URL } from "../../worker/bridge-url";
 import type {
   BridgeSocketHealth,
+  ConversationOption,
+  ParsedPacketEntry,
   SocketStatus,
   TelegramAuthMode,
 } from "../../worker/types";
@@ -35,6 +41,7 @@ interface StatusData {
   state?: string;
   authMode?: TelegramAuthMode;
   phoneCodeHash?: string;
+  phoneCodeLength?: number;
   passwordHint?: string;
   qrLoginUrl?: string;
   qrExpiresAt?: number;
@@ -44,6 +51,30 @@ interface StatusData {
   socketStatus?: SocketStatus;
   socketLastCheckedAt?: number;
   socketLastHealthyAt?: number;
+}
+
+interface RequestResultData {
+  className?: string;
+  payload?: unknown;
+  error?: string;
+  pending?: boolean;
+}
+
+function deriveTestDcOtp(
+  phone: string,
+  dcMode: DcMode,
+  phoneCodeLength?: number,
+): string | null {
+  if (dcMode !== "test") {
+    return null;
+  }
+  const normalized = phone.replace(/[^\d+]/g, "");
+  const match = normalized.match(/^(?:\+?99966|\+799966)(\d)\d{4}$/);
+  if (!match) {
+    return null;
+  }
+  const length = phoneCodeLength && phoneCodeLength > 0 ? phoneCodeLength : 5;
+  return match[1].repeat(length);
 }
 
 const DC_OPTIONS: Array<{
@@ -72,6 +103,7 @@ const STATE_LABELS: Record<string, string> = {
   MIGRATE_CONFIG_SENT: "Switching Telegram data center...",
   AWAITING_CODE: "Waiting for code",
   SIGN_IN_SENT: "Verifying code...",
+  SIGN_UP_SENT: "Creating test account...",
   PASSWORD_INFO_SENT: "Requesting password details...",
   AWAITING_PASSWORD: "Waiting for password",
   CHECK_PASSWORD_SENT: "Verifying password...",
@@ -127,12 +159,20 @@ export default function TelegramAuth() {
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<StatusData | null>(null);
   const [health, setHealth] = useState<BridgeSocketHealth | null>(null);
+  const [packetLog, setPacketLog] = useState<ParsedPacketEntry[]>([]);
+  const [conversations, setConversations] = useState<ConversationOption[]>([]);
+  const [conversationsUpdatedAt, setConversationsUpdatedAt] = useState(0);
+  const [selectedConversationId, setSelectedConversationId] = useState("");
+  const [messageText, setMessageText] = useState("");
+  const [messageResult, setMessageResult] = useState<RequestResultData | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [apiMethod, setApiMethod] = useState("");
   const [apiParams, setApiParams] = useState("{}");
-  const [apiResult, setApiResult] = useState<Record<string, unknown> | null>(null);
+  const [apiResult, setApiResult] = useState<RequestResultData | null>(null);
   const [restoring, setRestoring] = useState(true);
   const [isReconnecting, setIsReconnecting] = useState(false);
+  const [isRefreshingConversations, setIsRefreshingConversations] = useState(false);
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
   const qrRefreshRef = useRef<number | null>(null);
 
   const needsReconnect = useMemo(
@@ -208,6 +248,77 @@ export default function TelegramAuth() {
   }, [sessionKey, step]);
 
   useEffect(() => {
+    if (!sessionKey || step !== "ready") {
+      setPacketLog([]);
+      return;
+    }
+
+    const pollPackets = async () => {
+      const nextLog = await getPacketLog(sessionKey);
+      if (!("error" in nextLog)) {
+        setPacketLog(nextLog);
+      }
+    };
+
+    void pollPackets();
+    const interval = setInterval(() => {
+      void pollPackets();
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [sessionKey, step]);
+
+  useEffect(() => {
+    if (!sessionKey || step !== "ready") {
+      setConversations([]);
+      setConversationsUpdatedAt(0);
+      setSelectedConversationId("");
+      return;
+    }
+
+    const pollConversations = async () => {
+      const nextCache = await getConversations(sessionKey);
+      if ("error" in nextCache) {
+        return;
+      }
+      setConversations(nextCache.items);
+      setConversationsUpdatedAt(nextCache.updatedAt);
+      setSelectedConversationId((current) => {
+        if (current && nextCache.items.some((item) => item.id === current)) {
+          return current;
+        }
+        return nextCache.items[0]?.id || "";
+      });
+    };
+
+    void pollConversations();
+    const interval = setInterval(() => {
+      void pollConversations();
+    }, 1500);
+    return () => clearInterval(interval);
+  }, [sessionKey, step]);
+
+  useEffect(() => {
+    if (!sessionKey || step !== "ready") return;
+    if (conversationsUpdatedAt > 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      setIsRefreshingConversations(true);
+      try {
+        await refreshConversations(sessionKey);
+      } finally {
+        if (!cancelled) {
+          setIsRefreshingConversations(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationsUpdatedAt, sessionKey, step]);
+
+  useEffect(() => {
     if (!status?.qrLoginUrl) {
       setQrDataUrl("");
       return;
@@ -269,6 +380,12 @@ export default function TelegramAuth() {
       setHealth(null);
       setCode("");
       setPassword("");
+      setPacketLog([]);
+      setConversations([]);
+      setConversationsUpdatedAt(0);
+      setSelectedConversationId("");
+      setMessageText("");
+      setMessageResult(null);
       setApiResult(null);
       setStep(deriveStep(result));
     } catch (err) {
@@ -283,7 +400,15 @@ export default function TelegramAuth() {
   async function handleSubmitCode() {
     if (!code.trim()) return;
     try {
-      await submitCode(sessionKey, code.trim());
+      const result = await submitCode(sessionKey, code.trim()) as { state?: string; error?: string };
+      if (result.error) {
+        setStatus({
+          state: "ERROR",
+          error: result.error,
+        });
+        setStep("error");
+        return;
+      }
       setStatus((current) => ({ ...current, state: "SIGN_IN_SENT" }));
       setStep("waiting");
     } catch (err) {
@@ -344,6 +469,12 @@ export default function TelegramAuth() {
     setPassword("");
     setStatus(null);
     setHealth(null);
+    setPacketLog([]);
+    setConversations([]);
+    setConversationsUpdatedAt(0);
+    setSelectedConversationId("");
+    setMessageText("");
+    setMessageResult(null);
     setQrDataUrl("");
     setApiMethod("");
     setApiParams("{}");
@@ -365,8 +496,9 @@ export default function TelegramAuth() {
       }
 
       if (result.requestId) {
+        setApiResult({ pending: true });
         const poll = setInterval(async () => {
-          const res = await getResult(sessionKey, result.requestId!) as Record<string, unknown>;
+          const res = await getResult(sessionKey, result.requestId!) as RequestResultData;
           if (res && !res.pending) {
             clearInterval(poll);
             setApiResult(res);
@@ -381,9 +513,66 @@ export default function TelegramAuth() {
     }
   }
 
+  async function handleRefreshConversations() {
+    try {
+      setIsRefreshingConversations(true);
+      const result = await refreshConversations(sessionKey) as { requestId?: string; error?: string };
+      if (result.error) {
+        setMessageResult({ error: result.error });
+        return;
+      }
+    } catch (err) {
+      setMessageResult({
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setIsRefreshingConversations(false);
+    }
+  }
+
+  async function handleSendConversationMessage() {
+    if (!selectedConversationId || !messageText.trim()) return;
+    try {
+      setIsSendingMessage(true);
+      setMessageResult({ pending: true });
+      const result = await sendConversationMessage(
+        sessionKey,
+        selectedConversationId,
+        messageText.trim(),
+      ) as { requestId?: string; error?: string };
+      if (result.error) {
+        setMessageResult({ error: result.error });
+        return;
+      }
+
+      if (result.requestId) {
+        const poll = setInterval(async () => {
+          const res = await getResult(sessionKey, result.requestId!) as RequestResultData;
+          if (res && !res.pending) {
+            clearInterval(poll);
+            setMessageResult(res);
+            setMessageText("");
+            void handleRefreshConversations();
+          }
+        }, 500);
+        setTimeout(() => clearInterval(poll), 30000);
+      }
+    } catch (err) {
+      setMessageResult({
+        error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setIsSendingMessage(false);
+    }
+  }
+
   const qrCountdown = status?.qrExpiresAt
     ? Math.max(0, Math.ceil((status.qrExpiresAt - Date.now()) / 1000))
     : null;
+  const testOtpHint = deriveTestDcOtp(phone, dcMode, status?.phoneCodeLength);
+  const selectedConversation = conversations.find(
+    (conversation) => conversation.id === selectedConversationId,
+  );
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-background">
@@ -548,6 +737,11 @@ export default function TelegramAuth() {
               <p className="text-sm text-blue-700 dark:text-blue-300">
                 Verification code sent to <strong>{phone}</strong>
               </p>
+              {testOtpHint && (
+                <p className="mt-1 text-xs text-blue-600 dark:text-blue-300">
+                  Test DC detected. Suggested OTP: <span className="font-mono">{testOtpHint}</span>
+                </p>
+              )}
             </div>
             <div>
               <label
@@ -562,10 +756,10 @@ export default function TelegramAuth() {
                 value={code}
                 onChange={(e) => setCode(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleSubmitCode()}
-                placeholder="12345"
+                placeholder={testOtpHint || "12345"}
                 className="w-full p-3 border border-gray-300 rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent text-center text-2xl tracking-widest font-mono"
                 autoFocus
-                maxLength={6}
+                maxLength={status?.phoneCodeLength || 6}
               />
             </div>
             <button
@@ -683,6 +877,61 @@ export default function TelegramAuth() {
             </div>
 
             <div className="space-y-3 pt-2 border-t border-gray-200 dark:border-gray-700">
+              <div className="flex items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold">Recent Conversations</h2>
+                <button
+                  onClick={handleRefreshConversations}
+                  disabled={isRefreshingConversations}
+                  className="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium disabled:opacity-50"
+                >
+                  {isRefreshingConversations ? "Refreshing..." : "Refresh"}
+                </button>
+              </div>
+              <select
+                value={selectedConversationId}
+                onChange={(e) => setSelectedConversationId(e.target.value)}
+                className="w-full rounded-lg border border-gray-300 bg-background p-2 text-sm"
+              >
+                <option value="" disabled>
+                  {conversations.length > 0
+                    ? "Select a conversation"
+                    : "No conversations loaded yet"}
+                </option>
+                {conversations.map((conversation) => (
+                  <option key={conversation.id} value={conversation.id}>
+                    {conversation.title}
+                    {conversation.unreadCount
+                      ? ` (${conversation.unreadCount} unread)`
+                      : ""}
+                  </option>
+                ))}
+              </select>
+              {selectedConversation && (
+                <p className="text-xs text-gray-500">
+                  {selectedConversation.subtitle || selectedConversation.peerType}
+                </p>
+              )}
+              <textarea
+                value={messageText}
+                onChange={(e) => setMessageText(e.target.value)}
+                placeholder="Type a plain text message"
+                className="w-full h-24 resize-y rounded-lg border border-gray-300 bg-background p-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <button
+                onClick={handleSendConversationMessage}
+                disabled={!selectedConversationId || !messageText.trim() || isSendingMessage}
+                className="w-full p-2 bg-emerald-600 text-white rounded-lg hover:bg-emerald-700 disabled:opacity-50 transition-colors text-sm font-medium"
+              >
+                {isSendingMessage ? "Sending..." : "Send Message"}
+              </button>
+              {messageResult && (
+                <pre className="text-xs overflow-auto max-h-48 p-3 bg-gray-50 dark:bg-gray-900 rounded-lg font-mono border border-gray-200 dark:border-gray-700">
+                  {JSON.stringify(messageResult, null, 2)}
+                </pre>
+              )}
+            </div>
+
+            <div className="space-y-3 pt-2 border-t border-gray-200 dark:border-gray-700">
               <h2 className="text-sm font-semibold">Send API Method</h2>
               <input
                 type="text"
@@ -708,6 +957,39 @@ export default function TelegramAuth() {
                 <pre className="text-xs overflow-auto max-h-60 p-3 bg-gray-50 dark:bg-gray-900 rounded-lg font-mono border border-gray-200 dark:border-gray-700">
                   {JSON.stringify(apiResult, null, 2)}
                 </pre>
+              )}
+            </div>
+
+            <div className="space-y-3 pt-2 border-t border-gray-200 dark:border-gray-700">
+              <h2 className="text-sm font-semibold">Recent Parsed Packets</h2>
+              {packetLog.length === 0 ? (
+                <div className="rounded-lg border border-dashed border-gray-300 p-3 text-xs text-gray-500">
+                  Waiting for inbound packets...
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {packetLog.slice().reverse().map((packet) => (
+                    <div
+                      key={packet.id}
+                      className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-xs"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="font-semibold">{packet.className}</span>
+                        <span className="text-gray-500">
+                          {new Date(packet.receivedAt).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-[11px] text-gray-500 font-mono break-all">
+                        msgId={packet.msgId} seqNo={packet.seqNo}
+                        {packet.reqMsgId ? ` reqMsgId=${packet.reqMsgId}` : ""}
+                        {packet.requiresAck ? " acked" : ""}
+                      </p>
+                      <pre className="mt-2 overflow-auto max-h-40 rounded-lg bg-white p-2 font-mono text-[11px] border border-gray-200">
+                        {JSON.stringify(packet.payload, null, 2)}
+                      </pre>
+                    </div>
+                  ))}
+                </div>
               )}
             </div>
 

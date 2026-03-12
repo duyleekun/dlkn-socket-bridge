@@ -2,14 +2,18 @@
  * Cloudflare Worker entry point for telegram-worker.
  *
  * Routes:
- *   POST /cb/:sessionKey — Bridge callback (binary data or close event)
+ *   POST /cb/:callbackKey — Bridge callback (binary data or close event)
  *   Everything else       → vinext (React UI + Server Actions)
  */
 
 import handler from "vinext/server/app-router-entry";
 import { onResponse } from "./state-machine";
+import {
+  loadSessionKeyByCallbackKey,
+  loadSessionState,
+} from "./session-store";
 import { markSocketState } from "./socket-health";
-import type { Env, SessionState } from "./types";
+import type { Env } from "./types";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -17,7 +21,17 @@ export default {
 
     // ─── Bridge callback — the only non-vinext route ───
     if (request.method === "POST" && url.pathname.startsWith("/cb/")) {
-      const sessionKey = url.pathname.slice(4); // strip "/cb/"
+      const callbackKey = url.pathname.slice(4); // strip "/cb/"
+      const sessionKey = await loadSessionKeyByCallbackKey(env, callbackKey);
+      if (!sessionKey) {
+        return new Response("ok");
+      }
+
+      const state = await loadSessionState(env, sessionKey);
+      if (!state || state.callbackKey !== callbackKey) {
+        return new Response("ok");
+      }
+
       const rawBody = new Uint8Array(await request.arrayBuffer());
 
       // Check if it's a JSON close event
@@ -25,18 +39,12 @@ export default {
         const text = new TextDecoder().decode(rawBody);
         const json = JSON.parse(text) as { event?: string; reason?: string };
         if (json.event === "closed") {
-          const state = await env.TG_KV.get<SessionState>(
-            `session:${sessionKey}`,
-            "json",
+          await markSocketState(
+            env,
+            sessionKey,
+            "closed",
+            `connection closed: ${json.reason || "unknown"}`,
           );
-          if (state) {
-            await markSocketState(
-              env,
-              sessionKey,
-              "closed",
-              `connection closed: ${json.reason || "unknown"}`,
-            );
-          }
           return new Response("ok");
         }
       } catch {

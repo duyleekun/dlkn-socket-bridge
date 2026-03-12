@@ -43,6 +43,7 @@ import type { PasswordSrpState, SessionState } from "../types";
 interface StepResult {
   sendBytes: Uint8Array;
   stateUpdates: Partial<SessionState>;
+  msgId?: string;
 }
 
 /** Convert Uint8Array to BigInteger (for gramjs int128/int256/long fields). */
@@ -76,12 +77,13 @@ function buildEncryptedRequest(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   query: any,
   nextState: SessionState["state"],
-): { sendBytes: Uint8Array; stateUpdates: Partial<SessionState> } {
+  contentRelated: boolean = true,
+): StepResult {
   const request = state.connectionInited
     ? query
     : wrapInInitConnection(apiId, query);
   const body = serializeTLObject(request);
-  const seqNo = state.seqNo * 2 + 1;
+  const seqNo = contentRelated ? state.seqNo * 2 + 1 : state.seqNo * 2;
   const { encrypted, msgId } = encryptMessage(
     state.authKey!,
     state.serverSalt!,
@@ -97,9 +99,10 @@ function buildEncryptedRequest(
     stateUpdates: {
       state: nextState,
       connectionInited: true,
-      seqNo: state.seqNo + 1,
+      seqNo: state.seqNo + (contentRelated ? 1 : 0),
       lastMsgId: msgId.toString(),
     },
+    msgId: msgId.toString(),
   };
 }
 
@@ -122,6 +125,7 @@ export function buildReqPqMulti(): StepResult {
       lastMsgId: msgId.toString(),
       nonce: toHex(nonce),
     },
+    msgId: msgId.toString(),
   };
 }
 
@@ -226,6 +230,7 @@ export function handleResPQ(
       q: toHex(qBytes),
       fingerprint: matchedFpHex,
     },
+    msgId: msgId.toString(),
   };
 }
 
@@ -305,14 +310,8 @@ export function handleServerDHParams(
   const clientInnerHash = sha1(clientInnerBytes);
   const dataWithHash = concatBytes(clientInnerHash, clientInnerBytes);
 
-  // Pad to multiple of 16
-  const padNeeded = (16 - (dataWithHash.length % 16)) % 16;
-  const padded = padNeeded > 0
-    ? concatBytes(dataWithHash, generateNonce(padNeeded))
-    : dataWithHash;
-
   // Encrypt with same AES key/IV
-  const encryptedData = aesIgeEncrypt(padded, tmpAesKey, tmpAesIv);
+  const encryptedData = aesIgeEncrypt(dataWithHash, tmpAesKey, tmpAesIv);
 
   // Build set_client_DH_params
   const setDH = new Api.SetClientDHParams({
@@ -341,6 +340,7 @@ export function handleServerDHParams(
       serverSalt: toHex(serverSalt),
       timeOffset,
     },
+    msgId: msgId.toString(),
   };
 }
 
@@ -424,6 +424,22 @@ export function buildSignIn(
   });
 
   return buildEncryptedRequest(state, apiId, signIn, "SIGN_IN_SENT");
+}
+
+export function buildSignUp(
+  state: SessionState,
+  apiId: string,
+  firstName: string,
+  lastName: string,
+): StepResult {
+  const signUp = new Api.auth.SignUp({
+    phoneNumber: state.phone,
+    phoneCodeHash: state.phoneCodeHash!,
+    firstName,
+    lastName,
+  });
+
+  return buildEncryptedRequest(state, apiId, signUp, "SIGN_UP_SENT");
 }
 
 export function normalizePasswordSrp(
@@ -549,7 +565,7 @@ export function buildApiMethod(
   apiId: string,
   methodName: string,
   params: Record<string, unknown>,
-): { sendBytes: Uint8Array; stateUpdates: Partial<SessionState> } {
+): StepResult {
   // Resolve the API constructor from gramjs
   // e.g., "messages.GetDialogs" → Api.messages.GetDialogs
   const parts = methodName.split(".");
@@ -569,5 +585,63 @@ export function buildApiMethod(
     apiId,
     request,
     state.state,
+  );
+}
+
+export function buildGetDialogs(
+  state: SessionState,
+  apiId: string,
+  limit: number = 20,
+): StepResult {
+  return buildEncryptedRequest(
+    state,
+    apiId,
+    new Api.messages.GetDialogs({
+      offsetDate: 0,
+      offsetId: 0,
+      offsetPeer: new Api.InputPeerEmpty(),
+      limit,
+      hash: 0n,
+    }),
+    state.state,
+  );
+}
+
+function randomLong(): bigint {
+  const bytes = generateNonce(8);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return BigInt.asIntN(64, view.getBigInt64(0, true));
+}
+
+export function buildSendMessage(
+  state: SessionState,
+  apiId: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  peer: any,
+  message: string,
+): StepResult {
+  return buildEncryptedRequest(
+    state,
+    apiId,
+    new Api.messages.SendMessage({
+      peer,
+      message,
+      randomId: randomLong(),
+    }),
+    state.state,
+  );
+}
+
+export function buildMsgsAck(
+  state: SessionState,
+  apiId: string,
+  msgIds: bigint[],
+): StepResult {
+  return buildEncryptedRequest(
+    state,
+    apiId,
+    new Api.MsgsAck({ msgIds }),
+    state.state,
+    false,
   );
 }

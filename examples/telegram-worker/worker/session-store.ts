@@ -11,6 +11,8 @@ import type {
 
 export const SESSION_COOKIE_NAME = "tg_session_ref";
 
+const sessionStateCache = new Map<string, SessionState>();
+
 function sessionStateKey(sessionKey: string): string {
   return `session:${sessionKey}`;
 }
@@ -23,11 +25,24 @@ function persistedLinkKey(persistedSessionRef: string): string {
   return `persisted-link:${persistedSessionRef}`;
 }
 
+function callbackBindingKey(callbackKey: string): string {
+  return `callback:${callbackKey}`;
+}
+
 export async function loadSessionState(
   env: Env,
   sessionKey: string,
 ): Promise<SessionState | null> {
-  return env.TG_KV.get<SessionState>(sessionStateKey(sessionKey), "json");
+  const cached = sessionStateCache.get(sessionKey);
+  if (cached) {
+    return cached;
+  }
+
+  const state = await env.TG_KV.get<SessionState>(sessionStateKey(sessionKey), "json");
+  if (state) {
+    sessionStateCache.set(sessionKey, state);
+  }
+  return state;
 }
 
 export async function saveSessionState(
@@ -35,6 +50,7 @@ export async function saveSessionState(
   sessionKey: string,
   state: SessionState,
 ): Promise<void> {
+  sessionStateCache.set(sessionKey, state);
   await env.TG_KV.put(sessionStateKey(sessionKey), JSON.stringify(state));
 }
 
@@ -42,7 +58,33 @@ export async function deleteSessionState(
   env: Env,
   sessionKey: string,
 ): Promise<void> {
+  sessionStateCache.delete(sessionKey);
   await env.TG_KV.delete(sessionStateKey(sessionKey));
+}
+
+export async function loadSessionKeyByCallbackKey(
+  env: Env,
+  callbackKey: string,
+): Promise<string | null> {
+  return env.TG_KV.get(callbackBindingKey(callbackKey));
+}
+
+export async function saveCallbackBinding(
+  env: Env,
+  callbackKey: string,
+  sessionKey: string,
+): Promise<void> {
+  await env.TG_KV.put(callbackBindingKey(callbackKey), sessionKey);
+}
+
+export async function deleteCallbackBinding(
+  env: Env,
+  callbackKey: string | undefined,
+): Promise<void> {
+  if (!callbackKey) {
+    return;
+  }
+  await env.TG_KV.delete(callbackBindingKey(callbackKey));
 }
 
 export async function loadPersistedSession(
@@ -189,17 +231,19 @@ export async function rebuildSessionFromPersisted(
   bridgeUrl?: string,
 ): Promise<{ sessionKey: string; state: SessionState }> {
   const sessionKey = crypto.randomUUID();
+  const callbackKey = crypto.randomUUID();
   const normalizedWorkerUrl = normalizeUrl(workerUrl);
   const resolvedBridgeUrl = resolveBridgeUrl(bridgeUrl || persisted.bridgeUrl);
   const bridge = await createSession(
     resolvedBridgeUrl,
     `mtproto-frame://${persisted.dcIp}:${persisted.dcPort}`,
-    `${normalizedWorkerUrl}/cb/${sessionKey}`,
+    `${normalizedWorkerUrl}/cb/${callbackKey}`,
   );
 
   const state: SessionState = {
     state: "READY",
     authMode: persisted.authMode,
+    callbackKey,
     socketId: bridge.socket_id,
     bridgeUrl: resolvedBridgeUrl,
     phone: persisted.phone,
@@ -214,9 +258,10 @@ export async function rebuildSessionFromPersisted(
     seqNo: 0,
     timeOffset: persisted.timeOffset,
     connectionInited: false,
+    phoneCodeLength: undefined,
+    pendingPhoneCode: undefined,
     user: persisted.user,
     error: undefined,
-    pendingRequestId: undefined,
     phoneCodeHash: undefined,
     passwordHint: undefined,
     passwordSrp: undefined,
@@ -230,7 +275,10 @@ export async function rebuildSessionFromPersisted(
     socketLastHealthyAt: undefined,
   };
 
-  await saveSessionState(env, sessionKey, state);
+  await Promise.all([
+    saveSessionState(env, sessionKey, state),
+    saveCallbackBinding(env, callbackKey, sessionKey),
+  ]);
   await updatePersistedLinkFromState(env, sessionKey, state, "unknown");
   return { sessionKey, state };
 }

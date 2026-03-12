@@ -5,6 +5,7 @@ import {
   buildExportLoginToken,
   buildImportLoginToken,
   buildSignIn,
+  buildSignUp,
   normalizePasswordSrp,
 } from "../worker/mtproto/auth-steps";
 import { Api } from "../worker/mtproto/serializer";
@@ -22,6 +23,7 @@ function buildBaseState(): SessionState {
   return {
     state: "READY",
     authMode: "phone",
+    callbackKey: "callback-1",
     socketId: "socket-1",
     bridgeUrl: "http://localhost:3000",
     phone: "+1234567890",
@@ -125,6 +127,19 @@ test("authenticated request builders init connection when restoring a fresh runt
   );
   assert.equal(signIn.stateUpdates.state, "SIGN_IN_SENT");
   assert.equal(signIn.stateUpdates.connectionInited, true);
+
+  const signUp = buildSignUp(
+    {
+      ...state,
+      state: "SIGN_IN_SENT",
+      phoneCodeHash: "hash",
+    },
+    "123",
+    "Test",
+    "User",
+  );
+  assert.equal(signUp.stateUpdates.state, "SIGN_UP_SENT");
+  assert.equal(signUp.stateUpdates.connectionInited, true);
 
   const apiMethod = buildApiMethod(state, "123", "help.GetConfig", {});
   assert.equal(apiMethod.stateUpdates.state, "READY");

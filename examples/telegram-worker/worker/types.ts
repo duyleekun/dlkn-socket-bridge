@@ -24,6 +24,7 @@ export type State =
   | "MIGRATE_CONFIG_SENT"
   | "AWAITING_CODE"
   | "SIGN_IN_SENT"
+  | "SIGN_UP_SENT"
   | "PASSWORD_INFO_SENT"
   | "AWAITING_PASSWORD"
   | "CHECK_PASSWORD_SENT"
@@ -46,6 +47,7 @@ export interface PasswordSrpState {
 export interface SessionState {
   state: State;
   authMode: TelegramAuthMode;
+  callbackKey: string;
   socketId: string;
   bridgeUrl?: string;
   phone: string;
@@ -73,8 +75,9 @@ export interface SessionState {
   timeOffset: number;
   // Auth flow
   phoneCodeHash?: string;
+  phoneCodeLength?: number;
   connectionInited?: boolean;
-  pendingRequestId?: string;
+  pendingPhoneCode?: string;
   passwordHint?: string;
   passwordSrp?: PasswordSrpState;
   qrLoginUrl?: string;
@@ -139,4 +142,47 @@ export interface BridgeStatusResponse {
   uptime_secs: number;
   bytes_rx: number;
   bytes_tx: number;
+}
+
+export type PendingTelegramRequestKind =
+  | "generic"
+  | "dialogs"
+  | "send_message";
+
+export interface PendingTelegramRequest {
+  requestId: string;
+  kind: PendingTelegramRequestKind;
+  method: string;
+  createdAt: number;
+}
+
+export interface ParsedPacketEntry {
+  id: string;
+  msgId: string;
+  seqNo: number;
+  receivedAt: number;
+  requiresAck: boolean;
+  className: string;
+  envelopeClassName?: string;
+  reqMsgId?: string;
+  payload: unknown;
+}
+
+export type ConversationPeerType = "user" | "chat" | "channel";
+
+export interface ConversationOption {
+  id: string;
+  peerType: ConversationPeerType;
+  peerId: string;
+  accessHash?: string;
+  title: string;
+  subtitle?: string;
+  unreadCount?: number;
+  topMessage?: number;
+}
+
+export interface ConversationCache {
+  items: ConversationOption[];
+  updatedAt: number;
+  totalCount?: number;
 }
