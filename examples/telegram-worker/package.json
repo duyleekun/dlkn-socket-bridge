@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "big-integer": "^1.6.52",
+    "gramjs-statemachine": "file:../../packages/gramjs-statemachine",
     "next": "16.1.6",
     "qrcode": "^1.5.4",
     "react": "19.2.4",
@@ -22,6 +23,7 @@
     "@cloudflare/workers-types": "^4.20260305.0",
     "@playwright/test": "^1.58.2",
     "@tailwindcss/postcss": "^4",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-rsc": "^0.5.21",

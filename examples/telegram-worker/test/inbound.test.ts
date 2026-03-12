@@ -1,12 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import bigInt from "big-integer";
-import { MessageContainer, RPCResult, TLMessage } from "telegram/tl/core";
-import { Api, serializeTLObject } from "../worker/mtproto/serializer";
+import { Api } from "../worker/mtproto/serializer";
 import {
   buildConversationCacheFromDialogs,
   buildInputPeerFromConversation,
-  parseInboundObject,
 } from "../worker/mtproto/inbound";
 import {
   loadPendingRequests,
@@ -44,70 +42,37 @@ function fakeEnv(): Env {
   } as Env;
 }
 
-test("rpc results are normalized and correlated by reqMsgId", async () => {
-  const rpc = new RPCResult(
-    999n,
-    serializeTLObject(new Api.Pong({ msgId: 10n, pingId: 20n })),
-    undefined,
-  );
-
-  const parsed = await parseInboundObject(rpc, "1234", 1, 111);
-  assert.equal(parsed.entries.length, 1);
-  assert.deepEqual(parsed.ackMsgIds, ["1234"]);
-  assert.equal(parsed.rpcResults.length, 1);
-  assert.equal(parsed.rpcResults[0].reqMsgId, "999");
-  assert.equal(parsed.entries[0].className, "Pong");
-  assert.equal(parsed.entries[0].reqMsgId, "999");
-});
-
-test("message containers are flattened and ack-only service objects are skipped", async () => {
-  const container = new MessageContainer([
-    new TLMessage(11n, 1, new Api.MsgsAck({ msgIds: [1n] })),
-    new TLMessage(12n, 1, new Api.NewSessionCreated({
-      firstMsgId: 1n,
-      uniqueId: 2n,
-      serverSalt: 3n,
-    })),
-    new TLMessage(13n, 1, new Api.Pong({ msgId: 3n, pingId: 4n })),
-  ]);
-
-  const parsed = await parseInboundObject(container, "9999", 1, 222);
-  assert.equal(parsed.entries.length, 3);
-  assert.deepEqual(parsed.ackMsgIds, ["13"]);
-  assert.equal(parsed.entries[2].className, "Pong");
-});
-
 test("dialogs responses populate a conversation cache and rebuild input peers", () => {
   const dialogs = new Api.messages.Dialogs({
     dialogs: [
       new Api.Dialog({
-        peer: new Api.PeerUser({ userId: 1n }),
+        peer: new Api.PeerUser({ userId: bigInt(1) }),
         topMessage: 100,
         readInboxMaxId: 100,
         readOutboxMaxId: 100,
         unreadCount: 2,
         unreadMentionsCount: 0,
         unreadReactionsCount: 0,
-        notifySettings: new Api.PeerNotifySettings(),
+        notifySettings: new Api.PeerNotifySettings({}),
         pts: 1,
       }),
       new Api.Dialog({
-        peer: new Api.PeerChannel({ channelId: 2n }),
+        peer: new Api.PeerChannel({ channelId: bigInt(2) }),
         topMessage: 200,
         readInboxMaxId: 200,
         readOutboxMaxId: 200,
         unreadCount: 0,
         unreadMentionsCount: 0,
         unreadReactionsCount: 0,
-        notifySettings: new Api.PeerNotifySettings(),
+        notifySettings: new Api.PeerNotifySettings({}),
         pts: 1,
       }),
     ],
     messages: [],
     chats: [
       new Api.Channel({
-        id: 2n,
-        accessHash: 22n,
+        id: bigInt(2),
+        accessHash: bigInt(22),
         title: "Announcements",
         photo: new Api.ChatPhotoEmpty(),
         date: 0,
@@ -115,8 +80,8 @@ test("dialogs responses populate a conversation cache and rebuild input peers", 
     ],
     users: [
       new Api.User({
-        id: 1n,
-        accessHash: 11n,
+        id: bigInt(1),
+        accessHash: bigInt(11),
         firstName: "Duy",
         username: "duy",
       }),

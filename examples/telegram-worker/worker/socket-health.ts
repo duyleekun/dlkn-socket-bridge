@@ -5,14 +5,14 @@ import {
 } from "./bridge-client";
 import { resolveBridgeUrl } from "./bridge-url";
 import {
-  loadSessionState,
-  saveSessionState,
-  updatePersistedLinkFromState,
+  loadBridgeSession,
+  saveBridgeSession,
+  updatePersistedLinkFromBridge,
 } from "./session-store";
 import type {
+  BridgeSession,
   BridgeSocketHealth,
   Env,
-  SessionState,
   SocketStatus,
 } from "./types";
 
@@ -65,36 +65,32 @@ export async function markSocketState(
   sessionKey: string,
   socketStatus: SocketStatus,
   error?: string,
-): Promise<SessionState | null> {
-  const state = await loadSessionState(env, sessionKey);
-  if (!state) {
+): Promise<BridgeSession | null> {
+  const bridge = await loadBridgeSession(env, sessionKey);
+  if (!bridge) {
     return null;
   }
   const now = Date.now();
-  const nextState: SessionState = {
-    ...state,
-    state: state.state === "READY" ? "READY" : socketStatus === "healthy" ? state.state : "ERROR",
+  const updatedBridge: BridgeSession = {
+    ...bridge,
     socketStatus,
     socketLastCheckedAt: now,
     socketLastHealthyAt:
-      socketStatus === "healthy"
-        ? now
-        : state.socketLastHealthyAt,
-    error: socketStatus === "healthy" ? undefined : error || state.error,
+      socketStatus === "healthy" ? now : bridge.socketLastHealthyAt,
   };
-  await saveSessionState(env, sessionKey, nextState);
-  await updatePersistedLinkFromState(env, sessionKey, nextState, socketStatus);
-  return nextState;
+  await saveBridgeSession(env, sessionKey, updatedBridge);
+  await updatePersistedLinkFromBridge(env, sessionKey, updatedBridge, socketStatus);
+  return updatedBridge;
 }
 
 export async function probeBridgeSocket(
   env: Env,
   sessionKey: string,
-  state?: SessionState | null,
+  bridge?: BridgeSession | null,
 ): Promise<BridgeSocketHealth> {
-  const currentState = state ?? await loadSessionState(env, sessionKey);
+  const currentBridge = bridge ?? await loadBridgeSession(env, sessionKey);
   const now = Date.now();
-  if (!currentState) {
+  if (!currentBridge) {
     return {
       status: "unknown",
       socketId: "",
@@ -105,21 +101,20 @@ export async function probeBridgeSocket(
 
   try {
     const bridgeStatus = await getBridgeStatus(
-      resolveBridgeUrl(currentState.bridgeUrl),
-      currentState.socketId,
+      resolveBridgeUrl(currentBridge.bridgeUrl),
+      currentBridge.socketId,
     );
-    const nextState: SessionState = {
-      ...currentState,
+    const updatedBridge: BridgeSession = {
+      ...currentBridge,
       socketStatus: "healthy",
       socketLastCheckedAt: now,
       socketLastHealthyAt: now,
-      error: currentState.state === "READY" ? undefined : currentState.error,
     };
-    await saveSessionState(env, sessionKey, nextState);
-    await updatePersistedLinkFromState(env, sessionKey, nextState, "healthy");
+    await saveBridgeSession(env, sessionKey, updatedBridge);
+    await updatePersistedLinkFromBridge(env, sessionKey, updatedBridge, "healthy");
     return {
       status: "healthy",
-      socketId: currentState.socketId,
+      socketId: currentBridge.socketId,
       uptimeSecs: bridgeStatus.uptime_secs,
       bytesRx: bridgeStatus.bytes_rx,
       bytesTx: bridgeStatus.bytes_tx,
@@ -130,7 +125,7 @@ export async function probeBridgeSocket(
     await markSocketState(env, sessionKey, classified.status, classified.message);
     return {
       status: classified.status,
-      socketId: currentState.socketId,
+      socketId: currentBridge.socketId,
       lastCheckedAt: now,
       error: classified.message,
     };

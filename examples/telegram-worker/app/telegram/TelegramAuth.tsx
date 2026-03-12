@@ -39,6 +39,7 @@ type DcMode = "test" | "production";
 
 interface StatusData {
   state?: string;
+  phase?: string;
   authMode?: TelegramAuthMode;
   phoneCodeHash?: string;
   phoneCodeLength?: number;
@@ -58,6 +59,10 @@ interface RequestResultData {
   payload?: unknown;
   error?: string;
   pending?: boolean;
+}
+
+function hasPacketEnvelope(packet: ParsedPacketEntry): boolean {
+  return packet.msgId !== "0" || packet.seqNo !== 0 || Boolean(packet.reqMsgId);
 }
 
 function deriveTestDcOtp(
@@ -114,9 +119,13 @@ const STATE_LABELS: Record<string, string> = {
   ERROR: "Error",
 };
 
+function getStatusPhase(status: StatusData | null | undefined): string | undefined {
+  return status?.state ?? status?.phase;
+}
+
 function deriveStep(status: StatusData | null): Step {
   if (!status) return "phone";
-  switch (status.state) {
+  switch (getStatusPhase(status)) {
     case "AWAITING_CODE":
       return "code";
     case "AWAITING_PASSWORD":
@@ -215,7 +224,7 @@ export default function TelegramAuth() {
           return;
         }
         setStatus(nextStatus);
-        setAuthMode(nextStatus.authMode || authMode);
+        setAuthMode(("authMode" in nextStatus ? nextStatus.authMode : undefined) || authMode);
         setStep(deriveStep(nextStatus));
       })();
     }, 500);
@@ -237,7 +246,9 @@ export default function TelegramAuth() {
         });
         return;
       }
-      setHealth(nextHealth);
+      if (!("error" in nextHealth)) {
+        setHealth(nextHealth);
+      }
     };
 
     void pollHealth();
@@ -328,7 +339,7 @@ export default function TelegramAuth() {
     QRCode.toDataURL(status.qrLoginUrl, {
       margin: 1,
       width: 240,
-    }).then((dataUrl) => {
+    }).then((dataUrl: string) => {
       if (!cancelled) {
         setQrDataUrl(dataUrl);
       }
@@ -720,12 +731,12 @@ export default function TelegramAuth() {
               <p className="text-sm font-medium">
                 {needsReconnect
                   ? "Connection lost. Reconnect to continue."
-                  : status?.state
-                    ? STATE_LABELS[status.state] || status.state
+                  : getStatusPhase(status)
+                    ? STATE_LABELS[getStatusPhase(status)!] || getStatusPhase(status)
                     : "Connecting..."}
               </p>
               <p className="text-xs text-gray-400 font-mono">
-                {status?.state || "..."}
+                {getStatusPhase(status) || "..."}
               </p>
             </div>
           </div>
@@ -815,8 +826,8 @@ export default function TelegramAuth() {
           <div className="space-y-4">
             <div className="rounded-lg border border-gray-200 p-4 space-y-3 text-center">
               <p className="text-sm font-medium">
-                {status?.state
-                  ? STATE_LABELS[status.state] || status.state
+                {getStatusPhase(status)
+                  ? STATE_LABELS[getStatusPhase(status)!] || getStatusPhase(status)
                   : "Generating QR token..."}
               </p>
               {qrDataUrl ? (
@@ -971,20 +982,32 @@ export default function TelegramAuth() {
                   {packetLog.slice().reverse().map((packet) => (
                     <div
                       key={packet.id}
-                      className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-xs"
+                      className="rounded-lg border border-gray-200 bg-white p-3 text-xs text-slate-900 shadow-sm"
                     >
                       <div className="flex items-center justify-between gap-3">
-                        <span className="font-semibold">{packet.className}</span>
-                        <span className="text-gray-500">
+                        <div className="min-w-0">
+                          <span className="font-semibold text-slate-900">{packet.className}</span>
+                          {packet.envelopeClassName &&
+                            packet.envelopeClassName !== packet.className && (
+                              <span className="ml-2 text-[11px] text-slate-500">
+                                via {packet.envelopeClassName}
+                              </span>
+                            )}
+                        </div>
+                        <span className="text-slate-500">
                           {new Date(packet.receivedAt).toLocaleTimeString()}
                         </span>
                       </div>
-                      <p className="mt-1 text-[11px] text-gray-500 font-mono break-all">
-                        msgId={packet.msgId} seqNo={packet.seqNo}
-                        {packet.reqMsgId ? ` reqMsgId=${packet.reqMsgId}` : ""}
-                        {packet.requiresAck ? " acked" : ""}
-                      </p>
-                      <pre className="mt-2 overflow-auto max-h-40 rounded-lg bg-white p-2 font-mono text-[11px] border border-gray-200">
+                      {hasPacketEnvelope(packet) && (
+                        <p className="mt-1 break-all font-mono text-[11px] text-slate-500">
+                          {packet.msgId !== "0" ? `msgId=${packet.msgId}` : ""}
+                          {packet.msgId !== "0" && packet.seqNo !== 0 ? " " : ""}
+                          {packet.seqNo !== 0 ? `seqNo=${packet.seqNo}` : ""}
+                          {packet.reqMsgId ? ` reqMsgId=${packet.reqMsgId}` : ""}
+                          {packet.requiresAck ? " acked" : ""}
+                        </p>
+                      )}
+                      <pre className="mt-2 max-h-40 overflow-auto rounded-lg border border-slate-800 bg-slate-950 p-2 font-mono text-[11px] text-slate-100">
                         {JSON.stringify(packet.payload, null, 2)}
                       </pre>
                     </div>

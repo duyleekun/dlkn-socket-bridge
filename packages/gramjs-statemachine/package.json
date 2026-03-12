@@ -1,0 +1,28 @@
+{
+  "name": "gramjs-statemachine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.type-tests.json",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "big-integer": "^1.6.52",
+    "telegram": "2.26.22"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "tsx": "^4.20.6",
+    "typescript": "^5"
+  }
+}

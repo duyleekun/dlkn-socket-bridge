@@ -10,39 +10,40 @@
  *   [N bytes] message_data (the TL-serialized body)
  */
 
-/** Generate a GramJS-compatible message_id based on current time + offset. */
+/** Generate a time-based MTProto message ID. */
 export function generateMessageId(
   timeOffset: number = 0,
-  previousMsgId?: bigint,
+  previousMsgId: bigint = 0n,
 ): bigint {
   const now = Date.now() / 1000 + timeOffset;
   const seconds = Math.floor(now);
   const nanoseconds = Math.floor((now - seconds) * 1e9);
 
   let msgId = (BigInt(seconds) << 32n) | (BigInt(nanoseconds) << 2n);
-  if (previousMsgId !== undefined && previousMsgId >= msgId) {
+  if (previousMsgId !== 0n && previousMsgId >= msgId) {
     msgId = previousMsgId + 4n;
   }
   return msgId;
 }
 
 /**
- * Wrap a TL body into an unencrypted MTProto message.
+ * Wrap a TL body into an unencrypted MTProto plain message.
  *
  * @param body Serialized TL object bytes
  * @param timeOffset Server time offset in seconds
- * @returns The full unencrypted message bytes
+ * @param previousMsgId Previous message ID (to guarantee monotonicity)
+ * @returns { message, msgId }
  */
 export function wrapPlainMessage(
   body: Uint8Array,
   timeOffset: number = 0,
-  previousMsgId?: bigint,
+  previousMsgId: bigint = 0n,
 ): { message: Uint8Array; msgId: bigint } {
   const msgId = generateMessageId(timeOffset, previousMsgId);
   const result = new Uint8Array(8 + 8 + 4 + body.length);
   const view = new DataView(result.buffer);
 
-  // auth_key_id = 0 (8 bytes, all zeros — already default)
+  // auth_key_id = 0 (8 bytes, all zeros — default)
   // message_id (8 bytes, little-endian)
   view.setBigUint64(8, msgId, true);
   // message_data_length (4 bytes, little-endian)
@@ -54,7 +55,7 @@ export function wrapPlainMessage(
 }
 
 /**
- * Unwrap an unencrypted MTProto message.
+ * Unwrap an unencrypted MTProto plain message.
  *
  * @param data Raw message bytes (after transport frame is stripped)
  * @returns { msgId, body }
@@ -67,10 +68,11 @@ export function unwrapPlainMessage(
   }
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
 
-  // Verify auth_key_id = 0
   const authKeyId = view.getBigUint64(0, true);
   if (authKeyId !== 0n) {
-    throw new Error(`expected unencrypted message (auth_key_id=0), got ${authKeyId}`);
+    throw new Error(
+      `expected unencrypted message (auth_key_id=0), got ${authKeyId}`,
+    );
   }
 
   const msgId = view.getBigUint64(8, true);

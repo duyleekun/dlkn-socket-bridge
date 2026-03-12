@@ -8,9 +8,9 @@ use std::{
 };
 
 use axum::{
-    body::{to_bytes, Body, Bytes as AxumBytes},
+    body::Bytes as AxumBytes,
     extract::{Path, State},
-    http::{Request, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -19,7 +19,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::{header, Client as HttpClient};
-use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, ServerName};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -28,7 +28,6 @@ use tokio::{
     time::{Duration, Instant},
 };
 use tokio_tungstenite::tungstenite::Message;
-use tower::util::ServiceExt;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -155,6 +154,42 @@ fn should_flush(buf: &[u8], last_flush: Instant, flush: &FlushConfig) -> bool {
         return true;
     }
     false
+}
+
+fn build_root_store_from_certs(
+    certs: Vec<CertificateDer<'static>>,
+    load_error_count: usize,
+) -> anyhow::Result<rustls::RootCertStore> {
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut rejected_certs = 0usize;
+
+    for cert in certs {
+        if let Err(err) = root_store.add(cert) {
+            rejected_certs += 1;
+            warn!(error = %err, "failed to add native TLS root");
+        }
+    }
+
+    if root_store.is_empty() {
+        anyhow::bail!("no usable native TLS roots found");
+    }
+
+    info!(
+        roots = root_store.len(),
+        load_errors = load_error_count,
+        rejected_certs,
+        "loaded native TLS roots"
+    );
+
+    Ok(root_store)
+}
+
+fn load_native_root_store() -> anyhow::Result<rustls::RootCertStore> {
+    let cert_result = rustls_native_certs::load_native_certs();
+    for err in &cert_result.errors {
+        warn!(error = %err, "failed to load native TLS root");
+    }
+    build_root_store_from_certs(cert_result.certs, cert_result.errors.len())
 }
 
 fn build_app(state: AppState) -> Router {
@@ -501,10 +536,7 @@ async fn run_tcp_engine(
     let tcp = TcpStream::connect((host.as_str(), port)).await?;
 
     if use_tls {
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs()? {
-            root_store.add(cert)?;
-        }
+        let root_store = load_native_root_store()?;
         let tls_config = rustls::ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
@@ -850,7 +882,34 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use rustls::pki_types::pem::PemObject;
     use tokio::sync::{mpsc, oneshot, Mutex};
+    use tower::util::ServiceExt;
+
+    const TEST_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDPzCCAiegAwIBAgIURXxjS8Man8gFmk9HAu023yGNplMwDQYJKoZIhvcNAQEL
+BQAwJzElMCMGA1UEAwwcZGxrbi1zb2NrZXQtYnJpZGdlLXRlc3Qtcm9vdDAeFw0y
+NjAzMTIwNzM2MzRaFw0zNjAzMDkwNzM2MzRaMCcxJTAjBgNVBAMMHGRsa24tc29j
+a2V0LWJyaWRnZS10ZXN0LXJvb3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
+AoIBAQC2OrZPlPmeau3AWHBkv2iTn9xeGWmmMs0d3nAlf4lHZcCrS9H8RGF0LtV1
+6KAegBhvyRz2LEGDga5s2+agycIaeKSHuI7lbKRkZrITpsAR+mCkSwYXZ4jhwM8h
+JqO9Q2FM88LD+5VsnXiDCFaUZ2rOEenzVJVH5LI0uIsAarC9/1RNwHQFXkhFSzQ4
+Fb63Hui7uHCkWWqK7tpgXSGhJ38ftwzV5CHGHFij3s4z2jO8hsY4z1Ex/8ehYvgd
+sZbz8MneOtMP6Q9VyQ39/JSD4Regm3U4vW8GzanJ+v23dRh0sLNfnR7Hkyubby5z
+7glOrDWerSPZZca6Cz8z/2GXBS7nAgMBAAGjYzBhMB0GA1UdDgQWBBTpGYpdWqS0
+xkViQF1gZtw+VePUEDAfBgNVHSMEGDAWgBTpGYpdWqS0xkViQF1gZtw+VePUEDAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjANBgkqhkiG9w0BAQsFAAOC
+AQEAXaI4ZCvVXxO1EQwLd/XCE8AlUuwI8ARyMtZlQ4WtWyzwqsvU+kic6cNkicv7
+Hx/1ftwHwLaOrA61XV3PX3snDKiSrKy1xJC+f5VNN6QG0rAkq6JnfHCwZHbLeOTs
+wwT1edoFRZQK6Ud6efv+nuWeOhZc1RblZIq3ywdwA83jGQ3rC867TneWU+F2x5Eb
+i3WdNN1qhrxoZNmSY5axR2P0T+MsiQy3jNzk2XADPGPj9ExDc6+QJwDeWB4NdIx9
+bzS8/WLp4WoG6KeE2DjrRsugTTTtdlZTZdpIV+lW6m0L1e4Vt8K8J59dN8y5Fr5H
+BOFztO8fB8Q2LEyxj7qZCWNY4w==
+-----END CERTIFICATE-----";
 
     fn test_state() -> AppState {
         AppState {
@@ -881,6 +940,19 @@ mod tests {
 
     async fn send_request(app: Router, request: Request<Body>) -> Response {
         app.oneshot(request).await.expect("request should succeed")
+    }
+
+    #[test]
+    fn build_root_store_keeps_valid_roots_when_some_inputs_fail() {
+        let valid_cert = CertificateDer::from_pem_slice(TEST_CERT_PEM.as_bytes())
+            .expect("parse test certificate");
+        let root_store = build_root_store_from_certs(
+            vec![valid_cert, CertificateDer::from(vec![1_u8, 2, 3])],
+            1,
+        )
+        .expect("root store should keep the valid certificate");
+
+        assert_eq!(root_store.len(), 1);
     }
 
     #[tokio::test]

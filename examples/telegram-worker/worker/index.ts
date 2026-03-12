@@ -7,10 +7,10 @@
  */
 
 import handler from "vinext/server/app-router-entry";
-import { onResponse } from "./state-machine";
+import { onCallback } from "./adapter/on-callback";
 import {
   loadSessionKeyByCallbackKey,
-  loadSessionState,
+  loadBridgeSession,
 } from "./session-store";
 import { markSocketState } from "./socket-health";
 import type { Env } from "./types";
@@ -27,8 +27,8 @@ export default {
         return new Response("ok");
       }
 
-      const state = await loadSessionState(env, sessionKey);
-      if (!state || state.callbackKey !== callbackKey) {
+      const bridge = await loadBridgeSession(env, sessionKey);
+      if (!bridge || bridge.callbackKey !== callbackKey) {
         return new Response("ok");
       }
 
@@ -51,7 +51,7 @@ export default {
         // Not JSON — it's binary data, pass through to state machine
       }
 
-      await onResponse(env, url.origin, sessionKey, rawBody);
+      await onCallback(env, url.origin, sessionKey, rawBody);
       return new Response("ok");
     }
 

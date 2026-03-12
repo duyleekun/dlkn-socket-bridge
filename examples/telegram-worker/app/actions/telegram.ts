@@ -3,9 +3,9 @@
 import { cookies } from "next/headers";
 import { env as cfEnv } from "cloudflare:workers";
 import {
-  closeSession,
   createSession,
   sendBytes,
+  closeSession,
 } from "../../worker/bridge-client";
 import { normalizeUrl, resolveBridgeUrl } from "../../worker/bridge-url";
 import {
@@ -16,18 +16,19 @@ import {
   probeBridgeSocket,
 } from "../../worker/socket-health";
 import {
-  buildGetDialogs,
-  buildCheckPassword,
-  buildExportLoginToken,
-  buildImportLoginToken,
-  buildReqPqMulti,
-  buildSendMessage,
-  buildSendCode,
-  buildSignIn,
-  buildApiMethod,
-} from "../../worker/mtproto/auth-steps";
-import { buildInputPeerFromConversation } from "../../worker/mtproto/inbound";
-import { getDefaultTelegramDc } from "../../worker/mtproto/dc";
+  Api,
+  randomLong,
+  sendCode,
+  signIn,
+  checkPassword,
+  exportQrToken,
+  sendApiMethod,
+  createInitialState,
+  startDhExchange,
+  resolveTelegramDc,
+} from "gramjs-statemachine";
+import type { ApiMethodPath, SerializedState } from "gramjs-statemachine";
+import { buildInputPeerFromConversation } from "../../worker/inbound";
 import {
   clearRuntimeArtifacts,
   loadConversationCache,
@@ -35,27 +36,30 @@ import {
   trackPendingRequest,
 } from "../../worker/runtime-store";
 import {
-  deleteCallbackBinding,
   SESSION_COOKIE_NAME,
   decryptCookieValue,
+  deleteCallbackBinding,
   deletePersistedSessionArtifacts,
-  deleteSessionState,
+  deleteSession,
   encryptCookieValue,
+  loadBoth,
+  loadBridgeSession,
   loadPersistedLink,
   loadPersistedSession,
-  loadSessionState,
+  loadSerializedState,
+  persistReadySession,
   rebuildSessionFromPersisted,
-  saveSessionState,
+  saveBridgeSession,
   saveCallbackBinding,
+  saveSerializedState,
   shouldReuseRuntimeSession,
 } from "../../worker/session-store";
-import { wrapTransportFrame } from "../../worker/mtproto/transport";
 import type {
+  BridgeSession,
   BridgeSocketHealth,
   ConversationCache,
   Env,
   ParsedPacketEntry,
-  SessionState,
   TelegramAuthMode,
   TelegramDcMode,
 } from "../../worker/types";
@@ -102,39 +106,37 @@ async function clearPersistedSessionCookie(): Promise<void> {
   store.delete(SESSION_COOKIE_NAME);
 }
 
-function toStatusPayload(state: SessionState) {
+function toStatusPayload(state: SerializedState, bridge: BridgeSession) {
   return {
-    state: state.state,
-    authMode: state.authMode,
+    state: state.phase,
+    phase: state.phase,
+    authMode: bridge.authMode,
+    phone: bridge.phone,
     phoneCodeHash: state.phoneCodeHash,
     phoneCodeLength: state.phoneCodeLength,
     passwordHint: state.passwordHint,
-    qrLoginUrl: state.qrLoginUrl,
-    qrExpiresAt: state.qrExpiresAt,
-    sessionRef: state.persistedSessionRef,
+    qrLoginUrl: bridge.qrLoginUrl,
+    qrExpiresAt: bridge.qrExpiresAt,
+    sessionRef: bridge.persistedSessionRef,
     user: state.user,
-    error: state.error,
-    socketStatus: state.socketStatus,
-    socketLastCheckedAt: state.socketLastCheckedAt,
-    socketLastHealthyAt: state.socketLastHealthyAt,
+    error: state.error?.message,
+    socketStatus: bridge.socketStatus,
+    socketLastCheckedAt: bridge.socketLastCheckedAt,
+    socketLastHealthyAt: bridge.socketLastHealthyAt,
   };
 }
 
-async function sendSessionBytes(
+async function sendBridgeBytes(
   env: Env,
   sessionKey: string,
-  state: SessionState,
-  payload: Uint8Array,
+  bridge: BridgeSession,
+  bytes: Uint8Array,
 ): Promise<void> {
   try {
-    await sendBytes(
-      resolveBridgeUrl(state.bridgeUrl),
-      state.socketId,
-      wrapTransportFrame(payload),
-    );
+    await sendBytes(resolveBridgeUrl(bridge.bridgeUrl), bridge.socketId, bytes);
   } catch (error) {
     if (isSocketGoneError(error)) {
-      await cleanupSocket(resolveBridgeUrl(state.bridgeUrl), state.socketId);
+      await cleanupSocket(resolveBridgeUrl(bridge.bridgeUrl), bridge.socketId);
       await markSocketState(
         env,
         sessionKey,
@@ -144,47 +146,6 @@ async function sendSessionBytes(
     }
     throw error;
   }
-}
-
-async function dispatchReadyRequest(
-  env: Env,
-  sessionKey: string,
-  request: {
-    requestId: string;
-    kind: "generic" | "dialogs" | "send_message";
-    method: string;
-  },
-  build: (state: SessionState) => {
-    sendBytes: Uint8Array;
-    stateUpdates: Partial<SessionState>;
-    msgId?: string;
-  },
-): Promise<{ requestId: string } | { error: "not_ready" }> {
-  const state = await loadSessionState(env, sessionKey);
-  if (!state || state.state !== "READY") {
-    return { error: "not_ready" as const };
-  }
-
-  const built = build(state);
-  if (!built.msgId) {
-    throw new Error(`request ${request.method} is missing outbound msgId`);
-  }
-
-  const nextState = {
-    ...state,
-    ...built.stateUpdates,
-  } as SessionState;
-
-  await Promise.all([
-    saveSessionState(env, sessionKey, nextState),
-    trackPendingRequest(env, sessionKey, built.msgId, {
-      ...request,
-      createdAt: Date.now(),
-    }),
-  ]);
-  await sendSessionBytes(env, sessionKey, nextState, built.sendBytes);
-
-  return { requestId: request.requestId };
 }
 
 export async function startAuth(input: {
@@ -198,148 +159,142 @@ export async function startAuth(input: {
   const authMode = input.authMode;
   const dcMode = input.dcMode ?? "test";
   const resolvedBridgeUrl = resolveBridgeUrl(input.bridgeUrl);
-  const resolvedWorkerUrl = normalizeUrl(input.workerUrl || "");
-  const preset = getDefaultTelegramDc(dcMode);
+  const normalizedWorkerUrl = normalizeUrl(input.workerUrl || "");
   const sessionKey = crypto.randomUUID();
   const callbackKey = crypto.randomUUID();
 
-  const bridge = await createSession(
+  // Resolve DC
+  const dcId = dcMode === "test" ? 2 : 2;
+  const resolvedDc = resolveTelegramDc(dcMode, dcId);
+
+  // Create bridge socket
+  const bridgeResp = await createSession(
     resolvedBridgeUrl,
-    `mtproto-frame://${preset.ip}:${preset.port}`,
-    `${resolvedWorkerUrl}/cb/${callbackKey}`,
+    `mtproto-frame://${resolvedDc.ip}:${resolvedDc.port}`,
+    `${normalizedWorkerUrl}/cb/${callbackKey}`,
   );
 
-  const { sendBytes: pqBytes, stateUpdates } = buildReqPqMulti();
-  const state: SessionState = {
-    state: "PQ_SENT",
+  // Build initial state and start DH exchange
+  const initialState = createInitialState({
+    dcId: resolvedDc.id,
+    dcIp: resolvedDc.ip,
+    dcPort: resolvedDc.port,
+    dcMode,
+    apiId: env.TELEGRAM_API_ID,
+    apiHash: env.TELEGRAM_API_HASH,
+  });
+
+  const dhResult = await startDhExchange(initialState);
+  console.debug('[telegram.startAuth] initial DH request ready', {
+    sessionKey,
     authMode,
+    dcMode,
+    dcId: resolvedDc.id,
+    target: `${resolvedDc.ip}:${resolvedDc.port}`,
+    outboundLength: dhResult.outbound?.length ?? 0,
+    nextPhase: dhResult.nextState.phase,
+  });
+
+  const bridge: BridgeSession = {
+    sessionKey,
     callbackKey,
-    socketId: bridge.socket_id,
+    socketId: bridgeResp.socket_id,
     bridgeUrl: resolvedBridgeUrl,
+    authMode,
     phone: authMode === "phone" ? (input.phone || "").trim() : "",
     dcMode,
-    dcId: preset.id,
-    dcIp: preset.ip,
-    dcPort: preset.port,
-    seqNo: 0,
-    timeOffset: 0,
     socketStatus: "unknown",
-    ...stateUpdates,
   };
+
+  // Persist state + bridge + callback binding
   await Promise.all([
-    saveSessionState(env, sessionKey, state),
+    saveSerializedState(env, sessionKey, dhResult.nextState),
+    saveBridgeSession(env, sessionKey, bridge),
     saveCallbackBinding(env, callbackKey, sessionKey),
   ]);
-  await sendBytes(
-    resolvedBridgeUrl,
-    bridge.socket_id,
-    wrapTransportFrame(pqBytes),
-  );
 
-  return { sessionKey, ...toStatusPayload(state) };
+  // Send PQ request
+  await sendBridgeBytes(env, sessionKey, bridge, dhResult.outbound!);
+
+  return {
+    sessionKey,
+    ...toStatusPayload(dhResult.nextState, bridge),
+  };
 }
 
 export async function getStatus(sessionKey: string) {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state) {
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded) {
     return { error: "not_found" as const };
   }
-  if (state.state === "READY" && state.persistedSessionRef) {
-    await writePersistedSessionCookie(env, state.persistedSessionRef);
+  const { state, bridge } = loaded;
+  if (state.phase === "READY" && bridge.persistedSessionRef) {
+    await writePersistedSessionCookie(env, bridge.persistedSessionRef);
   }
-  return toStatusPayload(state);
+  return toStatusPayload(state, bridge);
 }
 
 export async function submitCode(sessionKey: string, code: string) {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state || state.state !== "AWAITING_CODE") {
-    console.warn("[actions.submitCode] invalid state", {
-      sessionKey,
-      currentState: state?.state,
-    });
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded) {
+    return { error: "not_found" as const };
+  }
+  const { state, bridge } = loaded;
+  if (state.phase !== "AWAITING_CODE") {
     return { error: "invalid_state" as const };
   }
 
-  const { sendBytes: signInBytes, stateUpdates } = buildSignIn(
-    state,
-    env.TELEGRAM_API_ID,
-    code.trim(),
-  );
-  const nextState = {
-    ...state,
-    ...stateUpdates,
-    pendingPhoneCode: code.trim(),
-  } as SessionState;
-  await saveSessionState(env, sessionKey, nextState);
-  console.log("[actions.submitCode] saved SIGN_IN_SENT", {
-    sessionKey,
-    previousState: state.state,
-    nextState: nextState.state,
-    phone: nextState.phone,
-    phoneCodeHash: nextState.phoneCodeHash,
-    phoneCodeLength: nextState.phoneCodeLength,
-  });
-  await sendSessionBytes(env, sessionKey, nextState, signInBytes);
-  console.log("[actions.submitCode] sent signIn bytes", {
-    sessionKey,
-    pendingPhoneCode: nextState.pendingPhoneCode,
-  });
+  const updatedBridge: BridgeSession = { ...bridge, pendingPhoneCode: code.trim() };
+  const result = await signIn(state, { code: code.trim() });
+  await Promise.all([
+    saveSerializedState(env, sessionKey, result.nextState),
+    saveBridgeSession(env, sessionKey, updatedBridge),
+  ]);
+  await sendBridgeBytes(env, sessionKey, updatedBridge, result.outbound!);
 
-  return { state: nextState.state };
+  return { phase: result.nextState.phase };
 }
 
 export async function submitPassword(sessionKey: string, password: string) {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state || state.state !== "AWAITING_PASSWORD") {
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded) {
+    return { error: "not_found" as const };
+  }
+  const { state, bridge } = loaded;
+  if (state.phase !== "AWAITING_PASSWORD") {
     return { error: "invalid_state" as const };
   }
 
-  const { sendBytes: passwordBytes, stateUpdates } = await buildCheckPassword(
-    state,
-    env.TELEGRAM_API_ID,
-    password,
-  );
-  const nextState = {
-    ...state,
-    ...stateUpdates,
-  } as SessionState;
-  await saveSessionState(env, sessionKey, nextState);
-  await sendSessionBytes(env, sessionKey, nextState, passwordBytes);
+  const result = await checkPassword(state, { password });
+  await saveSerializedState(env, sessionKey, result.nextState);
+  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
 
-  return { state: nextState.state };
+  return { phase: result.nextState.phase };
 }
 
 export async function refreshQrToken(sessionKey: string) {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded) {
+    return { error: "not_found" as const };
+  }
+  const { state, bridge } = loaded;
   if (
-    !state ||
-    (state.state !== "AWAITING_QR_SCAN" &&
-      state.state !== "QR_TOKEN_SENT" &&
-      state.state !== "QR_IMPORT_SENT")
+    state.phase !== "AWAITING_QR_SCAN" &&
+    state.phase !== "QR_TOKEN_SENT" &&
+    state.phase !== "QR_IMPORT_SENT"
   ) {
     return { error: "invalid_state" as const };
   }
 
-  const { sendBytes: tokenBytes, stateUpdates } = buildExportLoginToken(
-    state,
-    env.TELEGRAM_API_ID,
-    env.TELEGRAM_API_HASH,
-  );
-  const nextState = {
-    ...state,
-    ...stateUpdates,
-    qrLoginUrl: undefined,
-    qrTokenBase64Url: undefined,
-    qrExpiresAt: undefined,
-  } as SessionState;
-  await saveSessionState(env, sessionKey, nextState);
-  await sendSessionBytes(env, sessionKey, nextState, tokenBytes);
+  const result = await exportQrToken(state);
+  await saveSerializedState(env, sessionKey, result.nextState);
+  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
 
-  return { state: nextState.state };
+  return { phase: result.nextState.phase };
 }
 
 export async function restoreSessionFromCookie(
@@ -361,28 +316,35 @@ export async function restoreSessionFromCookie(
 
   const link = await loadPersistedLink(env, persistedSessionRef);
   if (link?.liveSessionKey) {
-    const liveState = await loadSessionState(env, link.liveSessionKey);
-    if (liveState) {
-      const health = await probeBridgeSocket(env, link.liveSessionKey, liveState);
-      if (shouldReuseRuntimeSession(liveState, health.status)) {
+    const liveBridge = await loadBridgeSession(env, link.liveSessionKey);
+    const liveState = await loadSerializedState(env, link.liveSessionKey);
+    if (liveBridge) {
+      const health = await probeBridgeSocket(env, link.liveSessionKey, liveBridge);
+      if (shouldReuseRuntimeSession(liveBridge, health.status)) {
         await writePersistedSessionCookie(env, persistedSessionRef);
-        const refreshedState = await loadSessionState(env, link.liveSessionKey);
-        return {
-          restored: true as const,
-          sessionKey: link.liveSessionKey,
-          health,
-          ...toStatusPayload(refreshedState || liveState),
-        };
+        const refreshedBridge = await loadBridgeSession(env, link.liveSessionKey);
+        const refreshedState = await loadSerializedState(env, link.liveSessionKey);
+        const b = refreshedBridge || liveBridge;
+        const s = refreshedState || liveState;
+        if (s) {
+          return {
+            restored: true as const,
+            sessionKey: link.liveSessionKey,
+            health,
+            ...toStatusPayload(s, b),
+          };
+        }
       }
     }
 
+    // Stale — clean up the live session
     if (link.socketId) {
       await cleanupSocket(link.bridgeUrl, link.socketId);
     }
-    if (liveState?.callbackKey) {
-      await deleteCallbackBinding(env, liveState.callbackKey);
+    if (liveBridge?.callbackKey) {
+      await deleteCallbackBinding(env, liveBridge.callbackKey);
     }
-    await deleteSessionState(env, link.liveSessionKey);
+    await deleteSession(env, link.liveSessionKey);
     await clearRuntimeArtifacts(env, link.liveSessionKey);
   }
 
@@ -392,34 +354,35 @@ export async function restoreSessionFromCookie(
     persisted,
     bridgeUrl,
   );
-  const health = await probeBridgeSocket(env, rebuilt.sessionKey, rebuilt.state);
+  const health = await probeBridgeSocket(env, rebuilt.sessionKey, rebuilt.bridge);
   await writePersistedSessionCookie(env, persistedSessionRef);
-  const restoredState = await loadSessionState(env, rebuilt.sessionKey);
+  const restoredBridge = await loadBridgeSession(env, rebuilt.sessionKey) || rebuilt.bridge;
+  const restoredState = await loadSerializedState(env, rebuilt.sessionKey) || rebuilt.state;
   return {
     restored: true as const,
     sessionKey: rebuilt.sessionKey,
     health,
-    ...toStatusPayload(restoredState || rebuilt.state),
+    ...toStatusPayload(restoredState, restoredBridge),
   };
 }
 
 export async function logoutSession(sessionKey?: string) {
   const env = getEnv();
   let persistedSessionRef = await readPersistedSessionRefFromCookie(env);
-  let activeState: SessionState | null = null;
+  let activeBridge: BridgeSession | null = null;
 
   if (sessionKey) {
-    activeState = await loadSessionState(env, sessionKey);
-    persistedSessionRef = activeState?.persistedSessionRef || persistedSessionRef;
+    activeBridge = await loadBridgeSession(env, sessionKey);
+    persistedSessionRef = activeBridge?.persistedSessionRef || persistedSessionRef;
   }
 
-  if (activeState?.socketId && activeState.bridgeUrl) {
-    await cleanupSocket(activeState.bridgeUrl, activeState.socketId);
+  if (activeBridge?.socketId && activeBridge.bridgeUrl) {
+    await cleanupSocket(activeBridge.bridgeUrl, activeBridge.socketId);
   }
 
   if (sessionKey) {
-    await deleteCallbackBinding(env, activeState?.callbackKey);
-    await deleteSessionState(env, sessionKey);
+    await deleteCallbackBinding(env, activeBridge?.callbackKey);
+    await deleteSession(env, sessionKey);
     await clearRuntimeArtifacts(env, sessionKey);
   }
 
@@ -429,9 +392,9 @@ export async function logoutSession(sessionKey?: string) {
       await cleanupSocket(link.bridgeUrl, link.socketId);
     }
     if (link?.liveSessionKey && link.liveSessionKey !== sessionKey) {
-      const linkedState = await loadSessionState(env, link.liveSessionKey);
-      await deleteCallbackBinding(env, linkedState?.callbackKey);
-      await deleteSessionState(env, link.liveSessionKey);
+      const linkedBridge = await loadBridgeSession(env, link.liveSessionKey);
+      await deleteCallbackBinding(env, linkedBridge?.callbackKey);
+      await deleteSession(env, link.liveSessionKey);
       await clearRuntimeArtifacts(env, link.liveSessionKey);
     }
     await deletePersistedSessionArtifacts(env, persistedSessionRef);
@@ -445,12 +408,11 @@ export async function getBridgeSocketHealth(
   sessionKey: string,
 ): Promise<BridgeSocketHealth | { error: "not_found" }> {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state) {
+  const bridge = await loadBridgeSession(env, sessionKey);
+  if (!bridge) {
     return { error: "not_found" as const };
   }
-  const health = await probeBridgeSocket(env, sessionKey, state);
-  return health;
+  return probeBridgeSocket(env, sessionKey, bridge);
 }
 
 export async function sendTelegramMethod(
@@ -459,22 +421,44 @@ export async function sendTelegramMethod(
   params: Record<string, unknown>,
 ) {
   const env = getEnv();
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded || loaded.state.phase !== "READY") {
+    return { error: "not_ready" as const };
+  }
+  const { state, bridge } = loaded;
+
+  // Build the API call using gramjs-statemachine
   const requestId = crypto.randomUUID();
-  return dispatchReadyRequest(
-    env,
-    sessionKey,
-    {
+  let result;
+  try {
+    result = await sendApiMethod(
+      state,
+      method as ApiMethodPath,
+      params as never,
+    );
+  } catch (error) {
+    if (isUnknownApiMethodError(error)) {
+      return { error: "unknown_method" as const };
+    }
+    throw error;
+  }
+  if (!result) {
+    return { error: "unknown_method" as const };
+  }
+  const msgId = result.nextState.lastMsgId;
+
+  await Promise.all([
+    saveSerializedState(env, sessionKey, result.nextState),
+    trackPendingRequest(env, sessionKey, msgId, {
       requestId,
       kind: "generic",
       method,
-    },
-    (state) => buildApiMethod(
-      state,
-      env.TELEGRAM_API_ID,
-      method,
-      params,
-    ),
-  );
+      createdAt: Date.now(),
+    }),
+  ]);
+  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
+
+  return { requestId };
 }
 
 export async function getResult(sessionKey: string, requestId: string) {
@@ -490,8 +474,8 @@ export async function getPacketLog(
   sessionKey: string,
 ): Promise<ParsedPacketEntry[] | { error: "not_found" }> {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state) {
+  const bridge = await loadBridgeSession(env, sessionKey);
+  if (!bridge) {
     return { error: "not_found" as const };
   }
   return loadPacketLog(env, sessionKey);
@@ -501,28 +485,47 @@ export async function getConversations(
   sessionKey: string,
 ): Promise<ConversationCache | { error: "not_found" }> {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state) {
+  const bridge = await loadBridgeSession(env, sessionKey);
+  if (!bridge) {
     return { error: "not_found" as const };
   }
-  return (
-    await loadConversationCache(env, sessionKey)
-  ) || { items: [], updatedAt: 0 };
+  return (await loadConversationCache(env, sessionKey)) || { items: [], updatedAt: 0 };
 }
 
 export async function refreshConversations(sessionKey: string) {
   const env = getEnv();
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded || loaded.state.phase !== "READY") {
+    return { error: "not_ready" as const };
+  }
+  const { state, bridge } = loaded;
+
   const requestId = crypto.randomUUID();
-  return dispatchReadyRequest(
-    env,
-    sessionKey,
+  const result = await sendApiMethod(
+    state,
+    "messages.GetDialogs",
     {
+      offsetDate: 0,
+      offsetId: 0,
+      offsetPeer: new Api.InputPeerEmpty(),
+      limit: 20,
+      hash: 0n,
+    },
+  );
+  const msgId = result.nextState.lastMsgId;
+
+  await Promise.all([
+    saveSerializedState(env, sessionKey, result.nextState),
+    trackPendingRequest(env, sessionKey, msgId, {
       requestId,
       kind: "dialogs",
       method: "messages.GetDialogs",
-    },
-    (state) => buildGetDialogs(state, env.TELEGRAM_API_ID),
-  );
+      createdAt: Date.now(),
+    }),
+  ]);
+  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
+
+  return { requestId };
 }
 
 export async function sendConversationMessage(
@@ -531,10 +534,11 @@ export async function sendConversationMessage(
   text: string,
 ) {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state || state.state !== "READY") {
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded || loaded.state.phase !== "READY") {
     return { error: "not_ready" as const };
   }
+  const { state, bridge } = loaded;
 
   const cache = await loadConversationCache(env, sessionKey);
   const conversation = cache?.items.find((item) => item.id === conversationId);
@@ -543,32 +547,42 @@ export async function sendConversationMessage(
   }
 
   const requestId = crypto.randomUUID();
-  return dispatchReadyRequest(
-    env,
-    sessionKey,
+  const inputPeer = buildInputPeerFromConversation(conversation);
+  const result = await sendApiMethod(
+    state,
+    "messages.SendMessage",
     {
+      peer: inputPeer,
+      message: text.trim(),
+      randomId: await randomLong(),
+      noWebpage: true,
+    },
+  );
+  const msgId = result.nextState.lastMsgId;
+
+  await Promise.all([
+    saveSerializedState(env, sessionKey, result.nextState),
+    trackPendingRequest(env, sessionKey, msgId, {
       requestId,
       kind: "send_message",
       method: "messages.SendMessage",
-    },
-    (latestState) => buildSendMessage(
-      latestState,
-      env.TELEGRAM_API_ID,
-      buildInputPeerFromConversation(conversation),
-      text.trim(),
-    ),
-  );
+      createdAt: Date.now(),
+    }),
+  ]);
+  await sendBridgeBytes(env, sessionKey, bridge, result.outbound!);
+
+  return { requestId };
 }
 
 export async function closeCurrentSocket(sessionKey: string) {
   const env = getEnv();
-  const state = await loadSessionState(env, sessionKey);
-  if (!state) {
+  const bridge = await loadBridgeSession(env, sessionKey);
+  if (!bridge) {
     return { error: "not_found" as const };
   }
 
   try {
-    await closeSession(resolveBridgeUrl(state.bridgeUrl), state.socketId);
+    await closeSession(resolveBridgeUrl(bridge.bridgeUrl), bridge.socketId);
   } catch (error) {
     if (!isSocketGoneError(error)) {
       throw error;
@@ -576,4 +590,10 @@ export async function closeCurrentSocket(sessionKey: string) {
   }
   await markSocketState(env, sessionKey, "closed", "socket closed by user");
   return { ok: true as const };
+}
+
+function isUnknownApiMethodError(error: unknown): boolean {
+  return error instanceof Error
+    && (error.message.startsWith("Unknown API method:")
+      || error.message.startsWith("API path is not a request:"));
 }

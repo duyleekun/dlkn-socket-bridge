@@ -15,84 +15,6 @@ export type SocketStatus =
   | "closed"
   | "error";
 
-export type State =
-  | "PQ_SENT"
-  | "DH_SENT"
-  | "DH_GEN_SENT"
-  | "AUTH_KEY_READY"
-  | "CODE_SENT"
-  | "MIGRATE_CONFIG_SENT"
-  | "AWAITING_CODE"
-  | "SIGN_IN_SENT"
-  | "SIGN_UP_SENT"
-  | "PASSWORD_INFO_SENT"
-  | "AWAITING_PASSWORD"
-  | "CHECK_PASSWORD_SENT"
-  | "QR_TOKEN_SENT"
-  | "AWAITING_QR_SCAN"
-  | "QR_IMPORT_SENT"
-  | "READY"
-  | "ERROR";
-
-export interface PasswordSrpState {
-  algoClass: "PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow";
-  g: number;
-  pHex: string;
-  salt1Hex: string;
-  salt2Hex: string;
-  srpBHex: string;
-  srpId: string;
-}
-
-export interface SessionState {
-  state: State;
-  authMode: TelegramAuthMode;
-  callbackKey: string;
-  socketId: string;
-  bridgeUrl?: string;
-  phone: string;
-  dcMode: TelegramDcMode;
-  dcId: number;
-  dcIp: string;
-  dcPort: number;
-  migrateToDc?: number;
-  // DH exchange state
-  nonce?: string;
-  serverNonce?: string;
-  newNonce?: string;
-  pq?: string;
-  p?: string;
-  q?: string;
-  fingerprint?: string;
-  // Auth key material
-  authKey?: string;
-  authKeyId?: string;
-  serverSalt?: string;
-  sessionId?: string;
-  // MTProto message state
-  seqNo: number;
-  lastMsgId?: string;
-  timeOffset: number;
-  // Auth flow
-  phoneCodeHash?: string;
-  phoneCodeLength?: number;
-  connectionInited?: boolean;
-  pendingPhoneCode?: string;
-  passwordHint?: string;
-  passwordSrp?: PasswordSrpState;
-  qrLoginUrl?: string;
-  qrTokenBase64Url?: string;
-  qrExpiresAt?: number;
-  pendingQrImportTokenBase64Url?: string;
-  persistedSessionRef?: string;
-  socketStatus: SocketStatus;
-  socketLastCheckedAt?: number;
-  socketLastHealthyAt?: number;
-  // Result
-  user?: Record<string, unknown>;
-  error?: string;
-}
-
 export interface PersistedTelegramSession {
   version: 1;
   persistedSessionRef: string;
@@ -185,4 +107,29 @@ export interface ConversationCache {
   items: ConversationOption[];
   updatedAt: number;
   totalCount?: number;
+}
+
+/**
+ * Bridge/transport metadata for an active session.
+ * Stored separately from SerializedState (pure MTProto protocol state).
+ * Both are stored in KV under different key prefixes, joined by sessionKey.
+ */
+export interface BridgeSession {
+  sessionKey: string;
+  callbackKey: string;
+  socketId: string;
+  bridgeUrl: string;
+  authMode: TelegramAuthMode;
+  phone: string;
+  dcMode: TelegramDcMode;
+  persistedSessionRef?: string;
+  pendingQrImportTokenBase64Url?: string;
+  pendingPhoneCode?: string;
+  /** QR login URL returned by login_qr_url action (displayed as QR code in UI) */
+  qrLoginUrl?: string;
+  /** QR login token expiry (unix ms) */
+  qrExpiresAt?: number;
+  socketStatus: SocketStatus;
+  socketLastCheckedAt?: number;
+  socketLastHealthyAt?: number;
 }
