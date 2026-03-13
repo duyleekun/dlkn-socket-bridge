@@ -1,0 +1,29 @@
+{
+  "name": "zca-js-statemachine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "default": "./src/index.ts",
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "pako": "^2.1.0",
+    "robot3": "^1.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/pako": "^2.0.4",
+    "tsx": "^4.20.6",
+    "typescript": "^5"
+  }
+}
