@@ -1,20 +1,11 @@
-import type { SerializedState } from './state.js';
+import type { SessionSnapshot } from '../session/session-snapshot.js';
 import type { SessionEvent } from './session-event.js';
-import type { TransportDirective } from './transport-directive.js';
+import type { SessionCommand } from './session-command.js';
+import type { SessionView } from '../session/session-view.js';
 
-export interface BeginAuthSessionResult {
-  nextState: SerializedState;
-  outbound: Uint8Array;
-  targetDc: {
-    id: number;
-    ip: string;
-    port: number;
-  };
-}
-
-export interface AdvanceSessionResult {
-  nextState: SerializedState;
-  outbound: Uint8Array[];
+export interface SessionTransitionResult {
+  snapshot: SessionSnapshot;
+  commands: SessionCommand[];
   events: SessionEvent[];
-  transport?: TransportDirective;
+  view: SessionView;
 }

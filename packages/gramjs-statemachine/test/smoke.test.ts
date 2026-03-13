@@ -8,21 +8,15 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyDataFromNonce, sha1 } from 'telegram/Helpers.js';
-import {
-  Api,
-  advanceSession,
-  beginAuthSession,
-  createInitialState,
-  sendApiMethod,
-  startDhExchange,
-  step,
-  sendCode,
-  signIn,
-  exportQrToken,
-  resolveTelegramDc,
-  parseMigrateDc,
-  normalizeTlValue,
-} from '../src/index.js';
+import { Api } from 'telegram/tl/index.js';
+import { createInitialState } from '../src/types/state.js';
+import type { SerializedState } from '../src/types/state.js';
+import { sendApiMethod } from '../src/api/invoke.js';
+import { sendCode, signIn, exportQrToken } from '../src/auth/login-steps.js';
+import { resolveTelegramDc, parseMigrateDc } from '../src/dc/dc-resolver.js';
+import { startDhExchange } from '../src/dh/dh-step1-req-pq.js';
+import { normalizeTlValue } from '../src/dispatch/inbound-dispatch.js';
+import { step } from '../src/step.js';
 import { buildReqPqMultiFrame } from '../src/dh/dh-step1-req-pq.js';
 import { buildReqDhParams } from '../src/dh/dh-step2-server-dh.js';
 import { buildSetClientDhParams } from '../src/dh/dh-step3-client-dh.js';
@@ -38,7 +32,6 @@ import { wrapPlainMessage } from '../src/framing/plain-message.js';
 import { createGramJsAuthKey } from '../src/session/auth-key.js';
 import { aesIgeEncrypt, toHex } from '../src/session/crypto.js';
 import { bigIntFromBytesBE, bigIntFromBytesLE, bigIntToBytesLE } from '../src/session/bigint-helpers.js';
-import type { SerializedState } from '../src/index.js';
 import {
   fromHex,
   makeRandomStream,
@@ -100,25 +93,6 @@ describe('createInitialState', () => {
     assert.equal(state.pendingQrImportTokenBase64Url, 'token-1');
     assert.equal(state.qrLoginUrl, 'tg://login?token=abc');
     assert.equal(state.qrExpiresAt, 123);
-  });
-});
-
-describe('beginAuthSession', () => {
-  it('embeds auth metadata and emits the first DH frame', async () => {
-    const result = await beginAuthSession({
-      apiId: '123',
-      apiHash: 'abc',
-      dcMode: 'test',
-      authMode: 'phone',
-      phone: '+15551234567',
-    });
-
-    assert.equal(result.targetDc.id, 2);
-    assert.equal(result.targetDc.ip, '149.154.167.40');
-    assert.equal(result.nextState.phase, 'PQ_SENT');
-    assert.equal(result.nextState.authMode, 'phone');
-    assert.equal(result.nextState.phone, '+15551234567');
-    assert.ok(result.outbound.length > 0);
   });
 });
 
@@ -369,45 +343,6 @@ describe('step() edge cases', () => {
       /ERROR phase/,
     );
   });
-});
-
-describe('advanceSession', () => {
-  it('ignores quick ack frames', async () => {
-    const state = {
-      ...createInitialState({ apiId: '1', apiHash: 'h' }),
-      phase: 'READY' as const,
-      connectionInited: true,
-      authKey: 'aa'.repeat(256),
-      authKeyId: 'bb'.repeat(8),
-      serverSalt: 'cc'.repeat(8),
-      sessionId: 'dd'.repeat(8),
-    };
-    const quickAck = new Uint8Array(4);
-    new DataView(quickAck.buffer).setUint32(0, 0x80000000, true);
-
-    const result = await advanceSession(state, quickAck);
-    assert.deepEqual(result.nextState, state);
-    assert.deepEqual(result.outbound, []);
-    assert.deepEqual(result.events, []);
-  });
-
-  it('turns negative MTProto server frames into ERROR state', async () => {
-    const state = {
-      ...createInitialState({ apiId: '1', apiHash: 'h' }),
-      phase: 'PQ_SENT' as const,
-    };
-
-    const result = await advanceSession(
-      state,
-      new Uint8Array([4, 0, 0, 0, 0x6c, 0xfe, 0xff, 0xff]),
-    );
-
-    assert.equal(result.nextState.phase, 'ERROR');
-    assert.equal(result.nextState.error?.message, 'MTProto server error: -404 during PQ_SENT');
-    assert.equal(result.nextState.error?.code, -404);
-    assert.deepEqual(result.outbound, []);
-  });
-
 });
 
 // ── login steps throw without required state ──────────────────────────────────

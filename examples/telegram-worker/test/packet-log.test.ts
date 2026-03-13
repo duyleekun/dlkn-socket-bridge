@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { handleSessionEvents } from "../worker/adapter/action-handler";
 import { loadPacketLog } from "../worker/runtime-store";
 import type { BridgeSession, Env } from "../worker/types";
-import type { SerializedState } from "gramjs-statemachine";
+import type { SessionSnapshot } from "gramjs-statemachine";
 
 class MemoryKV {
   private store = new Map<string, string>();
@@ -42,8 +42,12 @@ test("update packet log preserves inbound msgId and seqNo", async () => {
   const env = fakeEnv();
   const sessionKey = "session-1";
   const state = {
-    phase: "READY",
-  } as SerializedState;
+    version: 2,
+    value: "ready",
+    context: {
+      protocolPhase: "READY",
+    },
+  } as SessionSnapshot;
   const bridge: BridgeSession = {
     sessionKey,
     callbackKey: "callback-1",

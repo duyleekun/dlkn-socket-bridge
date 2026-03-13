@@ -1,4 +1,6 @@
-import { Api, sendApiMethod, createInitialState } from "../src/index.js";
+import { Api } from "telegram/tl/index.js";
+import { sendApiMethod } from "../src/api/invoke.js";
+import { createInitialState } from "../src/types/state.js";
 
 const readyState = {
   ...createInitialState({ apiId: "1", apiHash: "h" }),

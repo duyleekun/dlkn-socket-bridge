@@ -10,10 +10,10 @@ import { Factorizator } from 'telegram/crypto/Factorizator.js';
 import { getByteArray, generateKeyDataFromNonce, sha1 } from 'telegram/Helpers.js';
 import { buildReqDhParams } from '../src/dh/dh-step2-server-dh.js';
 import { buildSetClientDhParams } from '../src/dh/dh-step3-client-dh.js';
-import { createInitialState } from '../src/index.js';
+import { createInitialState } from '../src/types/state.js';
 import { aesIgeDecrypt, aesIgeEncrypt } from '../src/session/crypto.js';
 import { bigIntFromBytesBE, bigIntFromBytesLE } from '../src/session/bigint-helpers.js';
-import type { SerializedState } from '../src/index.js';
+import type { SerializedState } from '../src/types/state.js';
 import {
   FIXED_NOW_MS,
   makeRandomStream,

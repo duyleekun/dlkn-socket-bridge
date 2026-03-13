@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createInitialState } from "gramjs-statemachine";
+import { createInitialState } from "../../../packages/gramjs-statemachine/src/types/state.js";
+import { createSessionSnapshotFromLegacy } from "../../../packages/gramjs-statemachine/src/session/session-snapshot.js";
 import { onCallback } from "../worker/adapter/on-callback";
 import {
   loadSerializedState,
@@ -67,7 +68,7 @@ test("onCallback persists a deterministic error state for negative MTProto frame
   };
 
   await Promise.all([
-    saveSerializedState(env, sessionKey, state),
+    saveSerializedState(env, sessionKey, createSessionSnapshotFromLegacy(state)),
     saveBridgeSession(env, sessionKey, bridge),
   ]);
 
@@ -79,8 +80,8 @@ test("onCallback persists a deterministic error state for negative MTProto frame
   );
 
   const savedState = await loadSerializedState(env, sessionKey);
-  assert.equal(savedState?.phase, "ERROR");
-  assert.equal(savedState?.error?.message, "MTProto server error: -404 during PQ_SENT");
+  assert.equal(savedState?.value, "error");
+  assert.equal(savedState?.context.error?.message, "MTProto server error: -404 during PQ_SENT");
 });
 
 test("onCallback ignores later frames once a session is already in ERROR", async () => {
@@ -109,7 +110,7 @@ test("onCallback ignores later frames once a session is already in ERROR", async
   };
 
   await Promise.all([
-    saveSerializedState(env, sessionKey, state),
+    saveSerializedState(env, sessionKey, createSessionSnapshotFromLegacy(state)),
     saveBridgeSession(env, sessionKey, bridge),
   ]);
 
@@ -121,6 +122,46 @@ test("onCallback ignores later frames once a session is already in ERROR", async
   );
 
   const savedState = await loadSerializedState(env, sessionKey);
-  assert.equal(savedState?.phase, "ERROR");
-  assert.equal(savedState?.error?.message, "incorrect header check");
+  assert.equal(savedState?.value, "error");
+  assert.equal(savedState?.context.error?.message, "incorrect header check");
+});
+
+test("loadSerializedState refreshes from KV instead of serving stale cached status", async () => {
+  const env = fakeEnv();
+  const sessionKey = "session-stale-cache";
+  const initial = createSessionSnapshotFromLegacy({
+    ...createInitialState({
+      apiId: env.TELEGRAM_API_ID,
+      apiHash: env.TELEGRAM_API_HASH,
+      dcMode: "production",
+      dcId: 2,
+      dcIp: "149.154.167.50",
+      dcPort: 443,
+      authMode: "phone",
+      phone: "+15550001111",
+    }),
+    phase: "SIGN_IN_SENT" as const,
+  });
+  const updated = {
+    ...initial,
+    value: "awaiting_password" as const,
+    context: {
+      ...initial.context,
+      protocolPhase: "AWAITING_PASSWORD" as const,
+      passwordHint: "te***",
+    },
+  };
+
+  await saveSerializedState(env, sessionKey, initial);
+  const warmed = await loadSerializedState(env, sessionKey);
+  assert.equal(warmed?.value, "authorizing");
+
+  await env.TG_KV.put(
+    `sm-state:${sessionKey}`,
+    JSON.stringify(updated),
+  );
+
+  const refreshed = await loadSerializedState(env, sessionKey);
+  assert.equal(refreshed?.value, "awaiting_password");
+  assert.equal(refreshed?.context.passwordHint, "te***");
 });

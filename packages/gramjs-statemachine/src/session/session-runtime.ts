@@ -2,9 +2,9 @@ import type { InternalAction } from '../types/internal-action.js';
 import { createInitialState } from '../types/state.js';
 import type { SerializedState } from '../types/state.js';
 import type {
-  AdvanceSessionResult,
-  BeginAuthSessionResult,
+  SessionTransitionResult,
 } from '../types/session-result.js';
+import type { SessionCommand } from '../types/session-command.js';
 import type { SessionEvent } from '../types/session-event.js';
 import type { ReconnectDirective } from '../types/transport-directive.js';
 import { getDefaultTelegramDc, resolveTelegramDc } from '../dc/dc-resolver.js';
@@ -19,15 +19,71 @@ import {
   sendGetPassword,
   signIn,
 } from '../auth/login-steps.js';
+import {
+  sendApiMethod,
+  type ApiMethodParams,
+  type ApiMethodPath,
+} from '../api/invoke.js';
 import type { StepResult } from '../types/step-result.js';
+import type {
+  CreateSessionInput,
+  SessionHostEvent,
+  SessionSnapshot,
+} from './session-snapshot.js';
+import {
+  createSessionSnapshotFromLegacy,
+  toLegacySessionState,
+} from './session-snapshot.js';
+import { selectSessionView } from './session-view.js';
+import { runSessionMachine } from './session-machine.js';
 
-export interface BeginAuthSessionOptions {
+interface BeginAuthSessionOptions {
   apiId: string;
   apiHash: string;
   dcMode?: 'production' | 'test';
   dcId?: number;
   authMode: 'phone' | 'qr';
   phone?: string;
+}
+
+function toSessionCommandOutbound(frame: Uint8Array): SessionCommand {
+  return {
+    type: 'send_frame',
+    frame,
+  };
+}
+
+function toSessionCommandReconnect(
+  directive: ReconnectDirective,
+): SessionCommand {
+  return {
+    type: 'reconnect',
+    reason: directive.reason,
+    dcId: directive.dcId,
+    dcIp: directive.dcIp,
+    dcPort: directive.dcPort,
+    firstFrame: directive.firstOutbound,
+  };
+}
+
+function toTransitionResult(
+  nextState: SerializedState,
+  outbound: Uint8Array[],
+  events: SessionEvent[],
+  transport?: ReconnectDirective,
+): SessionTransitionResult {
+  const snapshot = createSessionSnapshotFromLegacy(nextState);
+  const commands: SessionCommand[] = [];
+  if (transport) {
+    commands.push(toSessionCommandReconnect(transport));
+  }
+  commands.push(...outbound.map(toSessionCommandOutbound));
+  return {
+    snapshot,
+    commands,
+    events,
+    view: selectSessionView(snapshot),
+  };
 }
 
 function toErrorState(
@@ -256,9 +312,9 @@ async function handleInternalAction(
   }
 }
 
-export async function beginAuthSession(
+async function beginAuthSession(
   opts: BeginAuthSessionOptions,
-): Promise<BeginAuthSessionResult> {
+) {
   const dcMode = opts.dcMode ?? 'production';
   const targetDc = opts.dcId === undefined
     ? getDefaultTelegramDc(dcMode)
@@ -281,21 +337,21 @@ export async function beginAuthSession(
   };
 }
 
-export async function submitAuthCode(
+async function submitAuthCode(
   state: SerializedState,
   code: string,
 ): Promise<StepResult> {
   return signIn(state, { code: code.trim() });
 }
 
-export async function submitAuthPassword(
+async function submitAuthPassword(
   state: SerializedState,
   password: string,
 ): Promise<StepResult> {
   return checkPassword(state, { password });
 }
 
-export async function refreshQrLogin(
+async function refreshQrLogin(
   state: SerializedState,
 ): Promise<StepResult> {
   const refreshedState = state.phase === 'QR_IMPORT_SENT'
@@ -309,10 +365,10 @@ export async function refreshQrLogin(
   return exportQrToken(refreshedState);
 }
 
-export async function advanceSession(
+async function advanceSession(
   state: SerializedState,
   inbound: Uint8Array,
-): Promise<AdvanceSessionResult> {
+) {
   if (state.phase === 'ERROR') {
     return {
       nextState: state,
@@ -381,4 +437,97 @@ export async function advanceSession(
       events: [],
     };
   }
+}
+
+export async function createSession(
+  input: CreateSessionInput,
+): Promise<SessionTransitionResult> {
+  const initial = await beginAuthSession(input);
+  return toTransitionResult(initial.nextState, [initial.outbound], []);
+}
+
+async function applySessionHostEvent(
+  snapshot: SessionSnapshot,
+  event: SessionHostEvent,
+): Promise<{
+  snapshot: SessionSnapshot;
+  commands: SessionCommand[];
+  events: SessionEvent[];
+}> {
+  const state = toLegacySessionState(snapshot);
+
+  switch (event.type) {
+    case 'inbound_frame': {
+      const result = await advanceSession(state, event.frame);
+      const next = toTransitionResult(
+        result.nextState,
+        result.outbound,
+        result.events,
+        result.transport,
+      );
+      return {
+        snapshot: next.snapshot,
+        commands: next.commands,
+        events: next.events,
+      };
+    }
+
+    case 'submit_code': {
+      const result = await submitAuthCode(state, event.code);
+      return {
+        snapshot: createSessionSnapshotFromLegacy(result.nextState),
+        commands: result.outbound ? [toSessionCommandOutbound(result.outbound)] : [],
+        events: [],
+      };
+    }
+
+    case 'submit_password': {
+      const result = await submitAuthPassword(state, event.password);
+      return {
+        snapshot: createSessionSnapshotFromLegacy(result.nextState),
+        commands: result.outbound ? [toSessionCommandOutbound(result.outbound)] : [],
+        events: [],
+      };
+    }
+
+    case 'refresh_qr': {
+      const result = await refreshQrLogin(state);
+      return {
+        snapshot: createSessionSnapshotFromLegacy(result.nextState),
+        commands: result.outbound ? [toSessionCommandOutbound(result.outbound)] : [],
+        events: [],
+      };
+    }
+
+    default: {
+      const _exhaustive: never = event;
+      return _exhaustive;
+    }
+  }
+}
+
+export async function transitionSession(
+  snapshot: SessionSnapshot,
+  event: SessionHostEvent,
+): Promise<SessionTransitionResult> {
+  return runSessionMachine(snapshot, event, applySessionHostEvent);
+}
+
+export async function invokeSessionMethod<M extends ApiMethodPath>(
+  snapshot: SessionSnapshot,
+  method: M,
+  params: ApiMethodParams<M>,
+  opts?: { contentRelated?: boolean },
+): Promise<SessionTransitionResult> {
+  const result = await sendApiMethod(
+    toLegacySessionState(snapshot),
+    method,
+    params,
+    opts,
+  );
+  return toTransitionResult(
+    result.nextState,
+    result.outbound ? [result.outbound] : [],
+    [],
+  );
 }

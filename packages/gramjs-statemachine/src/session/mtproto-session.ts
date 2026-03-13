@@ -103,19 +103,3 @@ export function readMtProtoSequence(state: RuntimeMtProtoState): number {
   return (state as unknown as { _sequence: number })._sequence;
 }
 
-/**
- * Apply updated sequence + msgId back to a state copy.
- * Returns a new state (does not mutate the input).
- */
-export function updateSequence(
-  state: SerializedState,
-  msgId: bigint,
-  contentRelated: boolean,
-): SerializedState {
-  return {
-    ...state,
-    lastMsgId: msgId.toString(),
-    sequence: state.sequence + (contentRelated ? 1 : 0),
-    connectionInited: true,
-  };
-}

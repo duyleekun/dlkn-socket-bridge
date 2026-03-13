@@ -1,13 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  advanceSession,
-  createInitialState,
-  resolveTelegramDc,
-  startDhExchange,
-} from "gramjs-statemachine";
+import { resolveTelegramDc } from "gramjs-statemachine";
+import { createInitialState } from "../../../packages/gramjs-statemachine/src/types/state.js";
+import { startDhExchange } from "../../../packages/gramjs-statemachine/src/dh/dh-step1-req-pq.js";
+import { advanceSession } from "../../../packages/gramjs-statemachine/src/session/session-runtime.js";
 import { handleSessionEvents } from "../worker/adapter/action-handler";
-import { applyReconnectDirective } from "../worker/bridge-session";
+import { applyReconnectCommand } from "../worker/bridge-session";
+import { createSessionSnapshotFromLegacy } from "../../../packages/gramjs-statemachine/src/session/session-snapshot.js";
 import {
   loadBridgeSession,
   loadPersistedSession,
@@ -50,7 +49,7 @@ function fakeEnv(): Env {
 }
 
 function buildReadyState() {
-  return {
+  return createSessionSnapshotFromLegacy({
     ...createInitialState({
       apiId: "12345",
       apiHash: "test-api-hash",
@@ -67,7 +66,7 @@ function buildReadyState() {
     serverSalt: "cc".repeat(8),
     sessionId: "dd".repeat(8),
     user: { id: "1", firstName: "Duy" },
-  };
+  });
 }
 
 function buildBridgeSession(overrides: Partial<BridgeSession> = {}): BridgeSession {
@@ -150,7 +149,7 @@ test("applyReconnectDirective rotates the bridge socket and callback binding", a
   }) as typeof fetch;
 
   try {
-    const updatedBridge = await applyReconnectDirective(
+    const updatedBridge = await applyReconnectCommand(
       env,
       "http://worker.test",
       bridge.sessionKey,
@@ -161,8 +160,7 @@ test("applyReconnectDirective rotates the bridge socket and callback binding", a
         dcId: targetDc.id,
         dcIp: targetDc.ip,
         dcPort: targetDc.port,
-        nextState: dh.nextState,
-        firstOutbound: dh.outbound!,
+        firstFrame: dh.outbound!,
       },
     );
 
@@ -186,20 +184,27 @@ test("handleSessionEvents persists QR auth state when the session reaches READY"
   const env = fakeEnv();
   const previousState = {
     ...buildReadyState(),
-    phase: "QR_IMPORT_SENT" as const,
-    user: undefined,
-    authMode: "qr" as const,
-    pendingQrImportTokenBase64Url: Buffer.from("import-me").toString("base64url"),
-    qrLoginUrl: "tg://login?token=old",
-    qrExpiresAt: Date.now() - 1000,
+    value: "authorizing" as const,
+    context: {
+      ...buildReadyState().context,
+      protocolPhase: "QR_IMPORT_SENT" as const,
+      user: undefined,
+      authMode: "qr" as const,
+      pendingQrImportTokenBase64Url: Buffer.from("import-me").toString("base64url"),
+      qrLoginUrl: "tg://login?token=old",
+      qrExpiresAt: Date.now() - 1000,
+    },
   };
   const nextState = {
     ...buildReadyState(),
-    authMode: "qr" as const,
-    phone: "",
-    pendingQrImportTokenBase64Url: undefined,
-    qrLoginUrl: undefined,
-    qrExpiresAt: undefined,
+    context: {
+      ...buildReadyState().context,
+      authMode: "qr" as const,
+      phone: "",
+      pendingQrImportTokenBase64Url: undefined,
+      qrLoginUrl: undefined,
+      qrExpiresAt: undefined,
+    },
   };
   const bridge = buildBridgeSession();
 

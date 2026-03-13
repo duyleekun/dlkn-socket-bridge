@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     str::FromStr,
     sync::{
@@ -73,6 +74,8 @@ struct CreateSocketRequest {
     callback_url: String,
     flush_interval_ms: Option<u64>,
     flush_bytes: Option<usize>,
+    #[serde(default)]
+    headers: Option<HashMap<String, String>>,
 }
 
 #[derive(Serialize)]
@@ -273,11 +276,14 @@ async fn create_socket(
         bytes: req.flush_bytes,
     };
 
+    let custom_headers = req.headers.unwrap_or_default();
+
     debug!(
         target_url = %target,
         callback_url = %callback,
         flush_interval_ms = ?flush.interval_ms,
         flush_bytes = ?flush.bytes,
+        custom_headers = ?custom_headers,
         "creating socket session"
     );
 
@@ -310,6 +316,7 @@ async fn create_socket(
                 bytes_rx,
                 bytes_tx,
                 &engine_socket_id,
+                &custom_headers,
             )
             .await
             {
@@ -816,9 +823,19 @@ async fn run_ws_engine(
     bytes_rx: SharedCounter,
     bytes_tx: SharedCounter,
     socket_id: &str,
+    custom_headers: &HashMap<String, String>,
 ) -> anyhow::Result<&'static str> {
-    let (ws_stream, _resp) = tokio_tungstenite::connect_async(target_url.as_str()).await?;
-    info!(socket_id = %socket_id, target = %target_url, "websocket connected");
+    let mut request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(target_url.as_str());
+    for (key, value) in custom_headers {
+        request = request.header(key.as_str(), value.as_str());
+    }
+    let request = request
+        .body(())
+        .map_err(|e| anyhow::anyhow!("failed to build WS request: {e}"))?;
+
+    let (ws_stream, _resp) = tokio_tungstenite::connect_async(request).await?;
+    info!(socket_id = %socket_id, target = %target_url, headers = custom_headers.len(), "websocket connected");
 
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
 

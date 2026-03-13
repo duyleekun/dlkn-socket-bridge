@@ -1,7 +1,7 @@
 /**
  * Internal reducer outputs used inside the state machine runtime.
  *
- * These are not the public host-facing events. `advanceSession()` converts the
+ * These are not the public host-facing events. `transitionSession()` converts the
  * observable subset into `SessionEvent` and consumes the protocol-only entries
  * internally.
  */

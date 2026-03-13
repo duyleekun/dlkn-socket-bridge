@@ -8,7 +8,7 @@ import type {
   PersistedTelegramSession,
   SocketStatus,
 } from "./types";
-import type { SerializedState } from "gramjs-statemachine";
+import type { SessionSnapshot } from "gramjs-statemachine";
 
 export const SESSION_COOKIE_NAME = "tg_session_ref";
 
@@ -36,7 +36,7 @@ function persistedLinkKey(persistedSessionRef: string): string {
 
 // ── In-memory caches (warm for a single Worker instance lifetime) ─────────────
 
-const serializedStateCache = new Map<string, SerializedState>();
+const serializedStateCache = new Map<string, SessionSnapshot>();
 const bridgeSessionCache = new Map<string, BridgeSession>();
 
 // ── State I/O ─────────────────────────────────────────────────────────────────
@@ -44,18 +44,20 @@ const bridgeSessionCache = new Map<string, BridgeSession>();
 export async function loadSerializedState(
   env: Env,
   sessionKey: string,
-): Promise<SerializedState | null> {
-  const cached = serializedStateCache.get(sessionKey);
-  if (cached) return cached;
-  const state = await env.TG_KV.get<SerializedState>(serializedStateKey(sessionKey), "json");
-  if (state) serializedStateCache.set(sessionKey, state);
+): Promise<SessionSnapshot | null> {
+  const state = await env.TG_KV.get<SessionSnapshot>(serializedStateKey(sessionKey), "json");
+  if (state) {
+    serializedStateCache.set(sessionKey, state);
+  } else {
+    serializedStateCache.delete(sessionKey);
+  }
   return state;
 }
 
 export async function saveSerializedState(
   env: Env,
   sessionKey: string,
-  state: SerializedState,
+  state: SessionSnapshot,
 ): Promise<void> {
   serializedStateCache.set(sessionKey, state);
   await env.TG_KV.put(serializedStateKey(sessionKey), JSON.stringify(state));
@@ -65,10 +67,12 @@ export async function loadBridgeSession(
   env: Env,
   sessionKey: string,
 ): Promise<BridgeSession | null> {
-  const cached = bridgeSessionCache.get(sessionKey);
-  if (cached) return cached;
   const bridge = await env.TG_KV.get<BridgeSession>(bridgeSessionKey(sessionKey), "json");
-  if (bridge) bridgeSessionCache.set(sessionKey, bridge);
+  if (bridge) {
+    bridgeSessionCache.set(sessionKey, bridge);
+  } else {
+    bridgeSessionCache.delete(sessionKey);
+  }
   return bridge;
 }
 
@@ -84,7 +88,7 @@ export async function saveBridgeSession(
 export async function loadBoth(
   env: Env,
   sessionKey: string,
-): Promise<{ state: SerializedState; bridge: BridgeSession } | null> {
+): Promise<{ state: SessionSnapshot; bridge: BridgeSession } | null> {
   const [state, bridge] = await Promise.all([
     loadSerializedState(env, sessionKey),
     loadBridgeSession(env, sessionKey),
@@ -224,11 +228,11 @@ export async function updatePersistedLinkFromBridge(
 export async function persistReadySession(
   env: Env,
   sessionKey: string,
-  state: SerializedState,
+  state: SessionSnapshot,
   bridge: BridgeSession,
   user?: Record<string, unknown>,
 ): Promise<BridgeSession> {
-  if (!state.authKey || !state.serverSalt) {
+  if (!state.context.authKey || !state.context.serverSalt) {
     throw new Error("cannot persist incomplete Telegram session — missing authKey/serverSalt");
   }
 
@@ -242,18 +246,18 @@ export async function persistReadySession(
   const record: PersistedTelegramSession = {
     version: 1,
     persistedSessionRef,
-    authMode: state.authMode || "qr",
-    phone: state.phone || "",
-    dcMode: state.dcMode,
-    dcId: state.dcId,
-    dcIp: state.dcIp,
-    dcPort: state.dcPort,
+    authMode: state.context.authMode || "qr",
+    phone: state.context.phone || "",
+    dcMode: state.context.dcMode,
+    dcId: state.context.dcId,
+    dcIp: state.context.dcIp,
+    dcPort: state.context.dcPort,
     bridgeUrl: resolveBridgeUrl(bridge.bridgeUrl),
-    authKey: state.authKey,
-    authKeyId: state.authKeyId,
-    serverSalt: state.serverSalt,
-    timeOffset: state.timeOffset,
-    user: user ?? state.user,
+    authKey: state.context.authKey,
+    authKeyId: state.context.authKeyId,
+    serverSalt: state.context.serverSalt,
+    timeOffset: state.context.timeOffset,
+    user: user ?? state.context.user,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
@@ -282,7 +286,7 @@ export async function persistReadySession(
 }
 
 /**
- * Rebuild a new SerializedState + BridgeSession from a persisted session record.
+ * Rebuild a new SessionSnapshot + BridgeSession from a persisted session record.
  * Used when resuming an existing authenticated session (cookie restore).
  */
 export async function rebuildSessionFromPersisted(
@@ -290,7 +294,7 @@ export async function rebuildSessionFromPersisted(
   workerUrl: string,
   persisted: PersistedTelegramSession,
   bridgeUrl?: string,
-): Promise<{ sessionKey: string; state: SerializedState; bridge: BridgeSession }> {
+): Promise<{ sessionKey: string; state: SessionSnapshot; bridge: BridgeSession }> {
   const sessionKey = crypto.randomUUID();
   const callbackKey = crypto.randomUUID();
   const normalizedWorkerUrl = normalizeUrl(workerUrl);
@@ -301,27 +305,30 @@ export async function rebuildSessionFromPersisted(
     `${normalizedWorkerUrl}/cb/${callbackKey}`,
   );
 
-  const state: SerializedState = {
-    version: 1,
-    phase: "READY",
-    dcId: persisted.dcId,
-    dcIp: persisted.dcIp,
-    dcPort: persisted.dcPort,
-    dcMode: persisted.dcMode,
-    apiId: env.TELEGRAM_API_ID,
-    apiHash: env.TELEGRAM_API_HASH,
-    authKey: persisted.authKey,
-    authKeyId: persisted.authKeyId,
-    serverSalt: persisted.serverSalt,
-    sessionId: toHex(generateNonce(8)),
-    timeOffset: persisted.timeOffset,
-    sequence: 0,
-    lastMsgId: "0",
-    connectionInited: false,
-    pendingRequests: {},
-    authMode: persisted.authMode,
-    phone: persisted.phone,
-    user: persisted.user,
+  const state: SessionSnapshot = {
+    version: 2,
+    value: "ready",
+    context: {
+      protocolPhase: "READY",
+      dcId: persisted.dcId,
+      dcIp: persisted.dcIp,
+      dcPort: persisted.dcPort,
+      dcMode: persisted.dcMode,
+      apiId: env.TELEGRAM_API_ID,
+      apiHash: env.TELEGRAM_API_HASH,
+      authKey: persisted.authKey,
+      authKeyId: persisted.authKeyId,
+      serverSalt: persisted.serverSalt,
+      sessionId: toHex(generateNonce(8)),
+      timeOffset: persisted.timeOffset,
+      sequence: 0,
+      lastMsgId: "0",
+      connectionInited: false,
+      pendingRequests: {},
+      authMode: persisted.authMode,
+      phone: persisted.phone,
+      user: persisted.user,
+    },
   };
 
   const bridge: BridgeSession = {

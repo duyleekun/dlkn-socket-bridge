@@ -35,14 +35,19 @@ export async function createSession(
   bridgeUrl: string,
   targetUrl: string,
   callbackUrl: string,
+  options?: { headers?: Record<string, string> },
 ): Promise<BridgeCreateResponse> {
+  const body: Record<string, unknown> = {
+    target_url: targetUrl,
+    callback_url: callbackUrl,
+  };
+  if (options?.headers && Object.keys(options.headers).length > 0) {
+    body.headers = options.headers;
+  }
   const res = await fetch(`${bridgeUrl}/sockets`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      target_url: targetUrl,
-      callback_url: callbackUrl,
-    }),
+    body: JSON.stringify(body),
   });
   if (!res.ok) {
     await readError(res, "bridge createSession failed");

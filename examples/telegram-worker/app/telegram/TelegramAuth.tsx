@@ -37,18 +37,27 @@ type Step =
   | "error";
 type DcMode = "test" | "production";
 
-interface StatusData {
+interface SessionViewData {
   state?: string;
-  phase?: string;
+  protocolPhase?: string;
+  screen?: Step;
+  statusText?: string;
   authMode?: TelegramAuthMode;
-  phoneCodeHash?: string;
-  phoneCodeLength?: number;
+  phone?: string;
+  codeLength?: number;
   passwordHint?: string;
   qrLoginUrl?: string;
   qrExpiresAt?: number;
-  sessionRef?: string;
   user?: Record<string, unknown>;
   error?: string;
+  canSubmitCode?: boolean;
+  canSubmitPassword?: boolean;
+  canRefreshQr?: boolean;
+}
+
+interface StatusData {
+  view?: SessionViewData;
+  sessionRef?: string;
   socketStatus?: SocketStatus;
   socketLastCheckedAt?: number;
   socketLastHealthyAt?: number;
@@ -99,66 +108,23 @@ const DC_OPTIONS: Array<{
   },
 ];
 
-const STATE_LABELS: Record<string, string> = {
-  PQ_SENT: "Requesting PQ...",
-  DH_SENT: "Diffie-Hellman exchange...",
-  DH_GEN_SENT: "Verifying auth key...",
-  AUTH_KEY_READY: "Auth key established",
-  CODE_SENT: "Requesting verification code...",
-  MIGRATE_CONFIG_SENT: "Switching Telegram data center...",
-  AWAITING_CODE: "Waiting for code",
-  SIGN_IN_SENT: "Verifying code...",
-  SIGN_UP_SENT: "Creating test account...",
-  PASSWORD_INFO_SENT: "Requesting password details...",
-  AWAITING_PASSWORD: "Waiting for password",
-  CHECK_PASSWORD_SENT: "Verifying password...",
-  QR_TOKEN_SENT: "Generating QR token...",
-  AWAITING_QR_SCAN: "Waiting for QR scan",
-  QR_IMPORT_SENT: "Finalizing QR login...",
-  READY: "Authenticated",
-  ERROR: "Error",
-};
-
-function getStatusPhase(status: StatusData | null | undefined): string | undefined {
-  return status?.state ?? status?.phase;
-}
-
-function deriveStep(status: StatusData | null): Step {
-  if (!status) return "phone";
-  switch (getStatusPhase(status)) {
-    case "AWAITING_CODE":
-      return "code";
-    case "AWAITING_PASSWORD":
-      return "password";
-    case "QR_TOKEN_SENT":
-    case "AWAITING_QR_SCAN":
-    case "QR_IMPORT_SENT":
-      return "qr";
-    case "READY":
-      return "ready";
-    case "ERROR":
-      return "error";
-    case "PQ_SENT":
-    case "DH_SENT":
-    case "DH_GEN_SENT":
-    case "AUTH_KEY_READY":
-    case "CODE_SENT":
-    case "MIGRATE_CONFIG_SENT":
-    case "SIGN_IN_SENT":
-    case "PASSWORD_INFO_SENT":
-    case "CHECK_PASSWORD_SENT":
-      return "waiting";
-    default:
-      return "phone";
-  }
-}
-
 function isHealthy(status?: SocketStatus): boolean {
   return status === "healthy" || status === "unknown" || status === undefined;
 }
 
+function createErrorStatus(message: string): StatusData {
+  return {
+    view: {
+      state: "error",
+      protocolPhase: "ERROR",
+      screen: "error",
+      statusText: "Error",
+      error: message,
+    },
+  };
+}
+
 export default function TelegramAuth() {
-  const [step, setStep] = useState<Step>("phone");
   const [authMode, setAuthMode] = useState<TelegramAuthMode>("phone");
   const [phone, setPhone] = useState("");
   const [dcMode, setDcMode] = useState<DcMode>("test");
@@ -183,6 +149,7 @@ export default function TelegramAuth() {
   const [isRefreshingConversations, setIsRefreshingConversations] = useState(false);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const qrRefreshRef = useRef<number | null>(null);
+  const step: Step = status?.view?.screen ?? "phone";
 
   const needsReconnect = useMemo(
     () => Boolean(sessionKey) && health && !isHealthy(health.status),
@@ -202,8 +169,7 @@ export default function TelegramAuth() {
         setSessionKey(restored.sessionKey);
         setStatus(restored);
         setHealth(restored.health ?? null);
-        setAuthMode(restored.authMode || "phone");
-        setStep(deriveStep(restored));
+        setAuthMode(restored.view?.authMode || "phone");
       }
     })();
 
@@ -219,13 +185,13 @@ export default function TelegramAuth() {
       void (async () => {
         const nextStatus = await getStatus(sessionKey);
         if ("error" in nextStatus && nextStatus.error === "not_found") {
-          setStatus({ error: "Session not found", state: "ERROR" });
-          setStep("error");
+          setStatus(createErrorStatus("Session not found"));
           return;
         }
-        setStatus(nextStatus);
-        setAuthMode(("authMode" in nextStatus ? nextStatus.authMode : undefined) || authMode);
-        setStep(deriveStep(nextStatus));
+        if (!("error" in nextStatus)) {
+          setStatus(nextStatus);
+          setAuthMode(nextStatus.view?.authMode || authMode);
+        }
       })();
     }, 500);
 
@@ -330,13 +296,13 @@ export default function TelegramAuth() {
   }, [conversationsUpdatedAt, sessionKey, step]);
 
   useEffect(() => {
-    if (!status?.qrLoginUrl) {
+    if (!status?.view?.qrLoginUrl) {
       setQrDataUrl("");
       return;
     }
 
     let cancelled = false;
-    QRCode.toDataURL(status.qrLoginUrl, {
+    QRCode.toDataURL(status.view.qrLoginUrl, {
       margin: 1,
       width: 240,
     }).then((dataUrl: string) => {
@@ -352,16 +318,16 @@ export default function TelegramAuth() {
     return () => {
       cancelled = true;
     };
-  }, [status?.qrLoginUrl]);
+  }, [status?.view?.qrLoginUrl]);
 
   useEffect(() => {
     if (qrRefreshRef.current) {
       window.clearTimeout(qrRefreshRef.current);
       qrRefreshRef.current = null;
     }
-    if (!sessionKey || step !== "qr" || !status?.qrExpiresAt) return;
+    if (!sessionKey || step !== "qr" || !status?.view?.qrExpiresAt) return;
 
-    const msUntilRefresh = Math.max(status.qrExpiresAt - Date.now() - 5000, 0);
+    const msUntilRefresh = Math.max(status.view.qrExpiresAt - Date.now() - 5000, 0);
     qrRefreshRef.current = window.setTimeout(() => {
       void (async () => {
         await refreshQrToken(sessionKey);
@@ -374,7 +340,7 @@ export default function TelegramAuth() {
         qrRefreshRef.current = null;
       }
     };
-  }, [sessionKey, status?.qrExpiresAt, step]);
+  }, [sessionKey, status?.view?.qrExpiresAt, step]);
 
   async function handleStartAuth() {
     if (authMode === "phone" && !phone.trim()) return;
@@ -398,52 +364,37 @@ export default function TelegramAuth() {
       setMessageText("");
       setMessageResult(null);
       setApiResult(null);
-      setStep(deriveStep(result));
     } catch (err) {
-      setStatus({
-        state: "ERROR",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      setStep("error");
+      setStatus(createErrorStatus(err instanceof Error ? err.message : String(err)));
     }
   }
 
   async function handleSubmitCode() {
     if (!code.trim()) return;
     try {
-      const result = await submitCode(sessionKey, code.trim()) as { state?: string; error?: string };
-      if (result.error) {
-        setStatus({
-          state: "ERROR",
-          error: result.error,
-        });
-        setStep("error");
+      const result = await submitCode(sessionKey, code.trim()) as StatusData | { error?: string };
+      if ("error" in result && result.error) {
+        setStatus(createErrorStatus(result.error));
         return;
       }
-      setStatus((current) => ({ ...current, state: "SIGN_IN_SENT" }));
-      setStep("waiting");
+      setStatus(result as StatusData);
     } catch (err) {
-      setStatus({
-        state: "ERROR",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      setStep("error");
+      setStatus(createErrorStatus(err instanceof Error ? err.message : String(err)));
     }
   }
 
   async function handleSubmitPassword() {
     if (!password.trim()) return;
     try {
-      await submitPassword(sessionKey, password);
+      const result = await submitPassword(sessionKey, password) as StatusData | { error?: string };
       setPassword("");
-      setStatus((current) => ({ ...current, state: "CHECK_PASSWORD_SENT" }));
-      setStep("waiting");
+      if ("error" in result && result.error) {
+        setStatus(createErrorStatus(result.error));
+        return;
+      }
+      setStatus(result as StatusData);
     } catch (err) {
-      setStatus({
-        state: "ERROR",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      setStep("error");
+      setStatus(createErrorStatus(err instanceof Error ? err.message : String(err)));
     }
   }
 
@@ -458,14 +409,9 @@ export default function TelegramAuth() {
         setSessionKey(restored.sessionKey);
         setStatus(restored);
         setHealth(restored.health ?? null);
-        setAuthMode(restored.authMode || authMode);
-        setStep(deriveStep(restored));
+        setAuthMode(restored.view?.authMode || authMode);
       } else {
-        setStatus({
-          state: "ERROR",
-          error: "No persisted session available to reconnect",
-        });
-        setStep("error");
+        setStatus(createErrorStatus("No persisted session available to reconnect"));
       }
     } finally {
       setIsReconnecting(false);
@@ -474,7 +420,6 @@ export default function TelegramAuth() {
 
   async function handleLogout() {
     await logoutSession(sessionKey || undefined);
-    setStep("phone");
     setSessionKey("");
     setCode("");
     setPassword("");
@@ -577,10 +522,15 @@ export default function TelegramAuth() {
     }
   }
 
-  const qrCountdown = status?.qrExpiresAt
-    ? Math.max(0, Math.ceil((status.qrExpiresAt - Date.now()) / 1000))
+  const qrExpiry = status?.view?.qrExpiresAt;
+  const qrCountdown = qrExpiry
+    ? Math.max(0, Math.ceil((qrExpiry - Date.now()) / 1000))
     : null;
-  const testOtpHint = deriveTestDcOtp(phone, dcMode, status?.phoneCodeLength);
+  const testOtpHint = deriveTestDcOtp(
+    phone,
+    dcMode,
+    status?.view?.codeLength,
+  );
   const selectedConversation = conversations.find(
     (conversation) => conversation.id === selectedConversationId,
   );
@@ -731,12 +681,10 @@ export default function TelegramAuth() {
               <p className="text-sm font-medium">
                 {needsReconnect
                   ? "Connection lost. Reconnect to continue."
-                  : getStatusPhase(status)
-                    ? STATE_LABELS[getStatusPhase(status)!] || getStatusPhase(status)
-                    : "Connecting..."}
+                  : status?.view?.statusText || "Connecting..."}
               </p>
               <p className="text-xs text-gray-400 font-mono">
-                {getStatusPhase(status) || "..."}
+                {status?.view?.protocolPhase || "..."}
               </p>
             </div>
           </div>
@@ -770,7 +718,7 @@ export default function TelegramAuth() {
                 placeholder={testOtpHint || "12345"}
                 className="w-full p-3 border border-gray-300 rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-green-500 focus:border-transparent text-center text-2xl tracking-widest font-mono"
                 autoFocus
-                maxLength={status?.phoneCodeLength || 6}
+                maxLength={status?.view?.codeLength || 6}
               />
             </div>
             <button
@@ -789,9 +737,9 @@ export default function TelegramAuth() {
               <p className="text-sm text-amber-900">
                 Telegram account password required.
               </p>
-              {status?.passwordHint && (
+              {status?.view?.passwordHint && (
                 <p className="mt-1 text-xs text-amber-700">
-                  Hint: {status.passwordHint}
+                  Hint: {status.view.passwordHint}
                 </p>
               )}
             </div>
@@ -826,9 +774,7 @@ export default function TelegramAuth() {
           <div className="space-y-4">
             <div className="rounded-lg border border-gray-200 p-4 space-y-3 text-center">
               <p className="text-sm font-medium">
-                {getStatusPhase(status)
-                  ? STATE_LABELS[getStatusPhase(status)!] || getStatusPhase(status)
-                  : "Generating QR token..."}
+                {status?.view?.statusText || "Generating QR token..."}
               </p>
               {qrDataUrl ? (
                 <img
@@ -841,13 +787,13 @@ export default function TelegramAuth() {
                   Waiting for QR token...
                 </div>
               )}
-              {status?.qrLoginUrl && (
+              {status?.view?.qrLoginUrl && (
                 <div className="space-y-2">
                   <p className="text-xs text-gray-500">
                     Scan with Telegram mobile: Settings → Devices → Link Desktop Device
                   </p>
                   <pre className="overflow-auto rounded-lg bg-gray-50 p-3 text-left text-[11px] text-gray-600">
-                    {status.qrLoginUrl}
+                    {status.view.qrLoginUrl}
                   </pre>
                 </div>
               )}
@@ -875,9 +821,9 @@ export default function TelegramAuth() {
                   Authenticated
                 </p>
               </div>
-              {status?.user && (
+              {status?.view?.user && (
                 <pre className="text-xs mt-2 overflow-auto max-h-40 text-green-700 dark:text-green-300 font-mono">
-                  {JSON.stringify(status.user, null, 2)}
+                  {JSON.stringify(status.view.user, null, 2)}
                 </pre>
               )}
               {status?.sessionRef && (
@@ -1032,7 +978,7 @@ export default function TelegramAuth() {
                 Error
               </p>
               <p className="text-sm text-red-600 dark:text-red-400 mt-1">
-                {status?.error || "Unknown error"}
+                {status?.view?.error || "Unknown error"}
               </p>
             </div>
             <button

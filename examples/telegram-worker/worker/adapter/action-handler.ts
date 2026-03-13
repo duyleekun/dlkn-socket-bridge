@@ -4,7 +4,7 @@
  * Protocol follow-up behavior now lives inside `gramjs-statemachine`.
  * This module only performs example-specific persistence and caching.
  */
-import type { SerializedState, SessionEvent } from "gramjs-statemachine";
+import type { SessionEvent, SessionSnapshot } from "gramjs-statemachine";
 import {
   persistReadySession,
 } from "../session-store";
@@ -19,20 +19,20 @@ import type { BridgeSession, Env } from "../types";
 export async function handleSessionEvents(
   env: Env,
   sessionKey: string,
-  previousState: SerializedState,
-  nextState: SerializedState,
+  previousState: SessionSnapshot,
+  nextState: SessionSnapshot,
   bridge: BridgeSession,
   events: SessionEvent[],
 ): Promise<BridgeSession> {
   let currentBridge = bridge;
 
-  if (previousState.phase !== "READY" && nextState.phase === "READY") {
+  if (previousState.value !== "ready" && nextState.value === "ready") {
     currentBridge = await persistReadySession(
       env,
       sessionKey,
       nextState,
       bridge,
-      nextState.user,
+      nextState.context.user,
     );
   }
 

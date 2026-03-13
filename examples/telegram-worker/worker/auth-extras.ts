@@ -5,8 +5,8 @@
  * All other auth operations are provided by the gramjs-statemachine library.
  */
 
-import { sendApiMethod } from "gramjs-statemachine";
-import type { SerializedState, StepResult } from "gramjs-statemachine";
+import { invokeSessionMethod } from "gramjs-statemachine";
+import type { SessionSnapshot, SessionTransitionResult } from "gramjs-statemachine";
 
 /**
  * Build an auth.SignUp request.
@@ -15,16 +15,16 @@ import type { SerializedState, StepResult } from "gramjs-statemachine";
  * auth.AuthorizationSignUpRequired (phone number not yet registered).
  */
 export async function buildSignUp(
-  state: SerializedState,
+  state: SessionSnapshot,
   firstName: string,
   lastName: string,
-): Promise<StepResult> {
-  return sendApiMethod(
+): Promise<SessionTransitionResult> {
+  return invokeSessionMethod(
     state,
     "auth.SignUp",
     {
-      phoneNumber: state.phone!,
-      phoneCodeHash: state.phoneCodeHash!,
+      phoneNumber: state.context.phone!,
+      phoneCodeHash: state.context.phoneCodeHash!,
       firstName,
       lastName,
     },

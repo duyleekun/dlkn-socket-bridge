@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite dev",
+    "dev": "sh -lc 'test -f .dev.vars || { echo \"error: missing .dev.vars\" >&2; echo \"Create it with TELEGRAM_API_ID and TELEGRAM_API_HASH before starting dev.\" >&2; exit 1; }; exec vite dev --host 127.0.0.1 --port 5173 --strictPort'",
     "build": "vite build",
     "deploy": "vite build && wrangler deploy",
     "test:mtproto": "node --import tsx --test test/*.test.ts",
@@ -11,7 +11,7 @@
   },
   "dependencies": {
     "big-integer": "^1.6.52",
-    "gramjs-statemachine": "file:../../packages/gramjs-statemachine",
+    "gramjs-statemachine": "workspace:*",
     "next": "16.1.6",
     "qrcode": "^1.5.4",
     "react": "19.2.4",
@@ -27,6 +27,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-rsc": "^0.5.21",
+    "react-server-dom-webpack": "^19.2.4",
     "tailwindcss": "^4",
     "tsx": "^4.20.6",
     "typescript": "^5",

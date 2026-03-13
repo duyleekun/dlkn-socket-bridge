@@ -2,17 +2,16 @@
  * Bridge callback handler backed by the higher-level gramjs-statemachine API.
  *
  * Flow:
- *   1. Load SerializedState + BridgeSession from KV
- *   2. Call advanceSession(state, inbound)
- *   3. Persist nextState
- *   4. Execute reconnect directive when present
- *   5. Send outbound bytes
- *   6. Process runtime session events
+ *   1. Load SessionSnapshot + BridgeSession from KV
+ *   2. Call transitionSession(snapshot, inbound event)
+ *   3. Persist snapshot
+ *   4. Execute commands
+ *   5. Process runtime session events
  */
 
 import {
-  advanceSession,
-  type SerializedState,
+  transitionSession,
+  type SessionSnapshot,
 } from "gramjs-statemachine";
 import {
   loadBoth,
@@ -26,8 +25,7 @@ import {
 } from "../socket-health";
 import { handleSessionEvents } from "./action-handler";
 import {
-  applyReconnectDirective,
-  sendBridgeBytes,
+  executeSessionCommands,
 } from "../bridge-session";
 import type { Env } from "../types";
 
@@ -46,35 +44,32 @@ export async function onCallback(
   const previousState = loaded.state;
   console.debug("[on-callback] inbound frame", {
     sessionKey,
-    phase: previousState.phase,
+    state: previousState.value,
+    protocolPhase: previousState.context.protocolPhase,
     frameLength: rawFrame.length,
     socketId: bridge.socketId,
   });
 
-  const result = await advanceSession(previousState, rawFrame);
-  await saveSerializedState(env, sessionKey, result.nextState);
+  const result = await transitionSession(previousState, {
+    type: "inbound_frame",
+    frame: rawFrame,
+  });
+  await saveSerializedState(env, sessionKey, result.snapshot);
 
   try {
-    if (result.transport?.type === "reconnect") {
-      bridge = await applyReconnectDirective(
-        env,
-        workerUrl,
-        sessionKey,
-        bridge,
-        result.transport,
-      );
-      await sendBridgeBytes(env, sessionKey, bridge, result.transport.firstOutbound);
-    }
-
-    for (const outbound of result.outbound) {
-      await sendBridgeBytes(env, sessionKey, bridge, outbound);
-    }
+    bridge = await executeSessionCommands(
+      env,
+      workerUrl,
+      sessionKey,
+      bridge,
+      result.commands,
+    );
 
     bridge = await handleSessionEvents(
       env,
       sessionKey,
       previousState,
-      result.nextState,
+      result.snapshot,
       bridge,
       result.events,
     );
@@ -91,13 +86,17 @@ export async function onCallback(
       return;
     }
 
-    const latestState = result.nextState;
-    if (latestState.phase !== "ERROR") {
-      const errorState: SerializedState = {
+    const latestState = result.snapshot;
+    if (latestState.value !== "error") {
+      const errorState: SessionSnapshot = {
         ...latestState,
-        phase: "ERROR",
-        error: {
-          message: error instanceof Error ? error.message : String(error),
+        value: "error",
+        context: {
+          ...latestState.context,
+          protocolPhase: "ERROR",
+          error: {
+            message: error instanceof Error ? error.message : String(error),
+          },
         },
       };
       await saveSerializedState(env, sessionKey, errorState);

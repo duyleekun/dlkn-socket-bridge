@@ -5,7 +5,7 @@
  * bytes through the Rust bridge, persisting state before outbound writes, and
  * rotating bridge sessions when the package requests a reconnect.
  */
-import type { SerializedState, TransportDirective } from "gramjs-statemachine";
+import type { SessionCommand, SessionSnapshot } from "gramjs-statemachine";
 import { createSession, sendBytes } from "./bridge-client";
 import { normalizeUrl, resolveBridgeUrl } from "./bridge-url";
 import {
@@ -45,34 +45,35 @@ export async function sendBridgeBytes(
   }
 }
 
-export async function persistStateAndSend(
+export async function persistStateAndExecute(
   env: Env,
+  workerUrl: string,
   sessionKey: string,
   bridge: BridgeSession,
-  nextState: SerializedState,
-  outbound: Uint8Array,
+  nextState: SessionSnapshot,
+  commands: SessionCommand[],
   extraWrites: Promise<unknown>[] = [],
-): Promise<void> {
+): Promise<BridgeSession> {
   // Persist first so the worker can safely resume after any bridge send error.
   await Promise.all([
     saveSerializedState(env, sessionKey, nextState),
     ...extraWrites,
   ]);
-  await sendBridgeBytes(env, sessionKey, bridge, outbound);
+  return executeSessionCommands(env, workerUrl, sessionKey, bridge, commands);
 }
 
-export async function applyReconnectDirective(
+export async function applyReconnectCommand(
   env: Env,
   workerUrl: string,
   sessionKey: string,
   bridge: BridgeSession,
-  directive: Extract<TransportDirective, { type: "reconnect" }>,
+  command: Extract<SessionCommand, { type: "reconnect" }>,
 ): Promise<BridgeSession> {
   const newCallbackKey = crypto.randomUUID();
   const normalizedWorkerUrl = normalizeUrl(workerUrl);
   const bridgeResp = await createSession(
     bridge.bridgeUrl,
-    `mtproto-frame://${directive.dcIp}:${directive.dcPort}`,
+    `mtproto-frame://${command.dcIp}:${command.dcPort}`,
     `${normalizedWorkerUrl}/cb/${newCallbackKey}`,
   );
 
@@ -93,4 +94,40 @@ export async function applyReconnectDirective(
 
   await cleanupSocket(bridge.bridgeUrl, bridge.socketId);
   return nextBridge;
+}
+
+export async function executeSessionCommands(
+  env: Env,
+  workerUrl: string,
+  sessionKey: string,
+  bridge: BridgeSession,
+  commands: SessionCommand[],
+): Promise<BridgeSession> {
+  let currentBridge = bridge;
+
+  for (const command of commands) {
+    switch (command.type) {
+      case "send_frame":
+        await sendBridgeBytes(env, sessionKey, currentBridge, command.frame);
+        break;
+
+      case "reconnect":
+        currentBridge = await applyReconnectCommand(
+          env,
+          workerUrl,
+          sessionKey,
+          currentBridge,
+          command,
+        );
+        await sendBridgeBytes(env, sessionKey, currentBridge, command.firstFrame);
+        break;
+
+      default: {
+        const _exhaustive: never = command;
+        void _exhaustive;
+      }
+    }
+  }
+
+  return currentBridge;
 }
