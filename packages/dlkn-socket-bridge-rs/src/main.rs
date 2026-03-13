@@ -28,7 +28,7 @@ use tokio::{
     sync::mpsc,
     time::{Duration, Instant},
 };
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -825,14 +825,7 @@ async fn run_ws_engine(
     socket_id: &str,
     custom_headers: &HashMap<String, String>,
 ) -> anyhow::Result<&'static str> {
-    let mut request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(target_url.as_str());
-    for (key, value) in custom_headers {
-        request = request.header(key.as_str(), value.as_str());
-    }
-    let request = request
-        .body(())
-        .map_err(|e| anyhow::anyhow!("failed to build WS request: {e}"))?;
+    let request = build_ws_request(&target_url, custom_headers)?;
 
     let (ws_stream, _resp) = tokio_tungstenite::connect_async(request).await?;
     info!(socket_id = %socket_id, target = %target_url, headers = custom_headers.len(), "websocket connected");
@@ -892,6 +885,24 @@ async fn run_ws_engine(
     };
 
     Ok(close_reason)
+}
+
+fn build_ws_request(
+    target_url: &reqwest::Url,
+    custom_headers: &HashMap<String, String>,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let mut request = target_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("failed to build base WS request: {e}"))?;
+    for (key, value) in custom_headers {
+        let header_name = header::HeaderName::from_bytes(key.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid WS header name {key:?}: {e}"))?;
+        let header_value = header::HeaderValue::from_str(value)
+            .map_err(|e| anyhow::anyhow!("invalid WS header value for {key:?}: {e}"))?;
+        request.headers_mut().insert(header_name, header_value);
+    }
+    Ok(request)
 }
 
 #[cfg(test)]
@@ -1139,5 +1150,42 @@ BOFztO8fB8Q2LEyxj7qZCWNY4w==
 
         let _ = shutdown_tx.send(());
         server.await.expect("callback server shutdown");
+    }
+
+    #[test]
+    fn build_ws_request_applies_custom_headers() {
+        let target_url =
+            reqwest::Url::parse("wss://chat.zalo.me/ws?zpw_ver=671&zpw_type=30")
+                .expect("parse websocket url");
+        let custom_headers = HashMap::from([
+            ("Origin".to_string(), "https://chat.zalo.me".to_string()),
+            ("User-Agent".to_string(), "TestAgent/1.0".to_string()),
+            ("Cookie".to_string(), "zpw_sek=abc123".to_string()),
+        ]);
+
+        let request = build_ws_request(&target_url, &custom_headers).expect("build ws request");
+
+        assert_eq!(request.uri(), target_url.as_str());
+        assert_eq!(
+            request
+                .headers()
+                .get("origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("https://chat.zalo.me")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("user-agent")
+                .and_then(|value| value.to_str().ok()),
+            Some("TestAgent/1.0")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("cookie")
+                .and_then(|value| value.to_str().ok()),
+            Some("zpw_sek=abc123")
+        );
     }
 }
