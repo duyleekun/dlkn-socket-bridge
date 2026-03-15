@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0a0a0f;
+  --foreground: #f8fafc;
+  --card: #13131a;
+  --card-border: rgba(255, 255, 255, 0.08);
+  --card-glow: rgba(99, 102, 241, 0.15);
+  --primary: #6366f1;
+  --telegram: #0ea5e9;
+  --zalo: #0075ff;
+  --muted: #94a3b8;
+  --success: #22c55e;
+  --error: #ef4444;
+  --warning: #f59e0b;
+  --surface: #1a1a24;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-border: var(--card-border);
+  --color-primary: var(--primary);
+  --color-telegram: var(--telegram);
+  --color-zalo: var(--zalo);
+  --color-muted: var(--muted);
+  --color-success: var(--success);
+  --color-error: var(--error);
+  --color-warning: var(--warning);
+  --color-surface: var(--surface);
+  --font-sans: system-ui, -apple-system, Arial, Helvetica, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 1rem;
+  transition: box-shadow 0.3s ease;
+}
+
+.card:hover {
+  box-shadow: 0 0 20px var(--card-glow);
+}
+
+.activity-log {
+  font-family: 'JetBrains Mono', 'Fira Code', var(--font-mono), monospace;
+}
+
+.activity-row:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.activity-row:nth-child(odd) {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Smooth scroll for activity log */
+.activity-scroll {
+  scroll-behavior: smooth;
+}
+
+/* Pulsing ring animation for auth stepper */
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(99, 102, 241, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(99, 102, 241, 0);
+  }
+}
+
+.pulse-ring {
+  animation: pulse-ring 2s infinite;
+}
+
+/* QR expired overlay */
+.qr-expired-overlay {
+  backdrop-filter: blur(6px);
+  background: rgba(0, 0, 0, 0.5);
+}
+
+/* Tab gradient indicator */
+.tab-active-telegram {
+  background: linear-gradient(135deg, #0ea5e9, #6366f1);
+}
+
+.tab-active-zalo {
+  background: linear-gradient(135deg, #0075ff, #6366f1);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}

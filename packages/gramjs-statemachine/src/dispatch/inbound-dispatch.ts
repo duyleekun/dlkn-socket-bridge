@@ -269,7 +269,6 @@ export function buildLoginActions(
       ...state,
       phase: 'READY',
       user,
-      pendingQrImportTokenBase64Url: undefined,
       qrLoginUrl: undefined,
       qrExpiresAt: undefined,
     };
@@ -337,7 +336,6 @@ export function buildLoginActions(
         ...state,
         phase: 'READY',
         user,
-        pendingQrImportTokenBase64Url: undefined,
         qrLoginUrl: undefined,
         qrExpiresAt: undefined,
       };

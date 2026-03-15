@@ -93,13 +93,11 @@ describe('createInitialState', () => {
       apiHash: 'h',
       authMode: 'phone',
       phone: '+123',
-      pendingQrImportTokenBase64Url: 'token-1',
       qrLoginUrl: 'tg://login?token=abc',
       qrExpiresAt: 123,
     });
     assert.equal(state.authMode, 'phone');
     assert.equal(state.phone, '+123');
-    assert.equal(state.pendingQrImportTokenBase64Url, 'token-1');
     assert.equal(state.qrLoginUrl, 'tg://login?token=abc');
     assert.equal(state.qrExpiresAt, 123);
   });
@@ -445,6 +443,25 @@ describe('QR login dispatch', () => {
     serverSalt: 'cc'.repeat(8),
     sessionId: 'dd'.repeat(8),
   };
+
+  it('stores the exported QR token for later import', () => {
+    const qrToken = Buffer.from('scan-me');
+    const result = buildLoginActions(
+      'auth.ExportLoginToken',
+      new Api.auth.LoginToken({
+        token: qrToken,
+        expires: 123,
+      }),
+      readyState,
+    );
+
+    assert.ok(result);
+    assert.equal(result?.updatedState.phase, 'AWAITING_QR_SCAN');
+    assert.equal(
+      result?.updatedState.qrLoginUrl,
+      `tg://login?token=${qrToken.toString('base64url')}`,
+    );
+  });
 
   it('maps auth.LoginTokenSuccess to login_success', () => {
     const result = buildLoginActions(

@@ -133,7 +133,7 @@ async function buildReconnectDirective(
   state: SerializedState,
   targetDcId: number,
   reason: ReconnectDirective['reason'],
-  pendingQrImportTokenBase64Url?: string,
+  qrLoginUrl?: string,
 ): Promise<ReconnectDirective> {
   const targetDc = resolveTelegramDc(state.dcMode, targetDcId);
   const resetState = createInitialState({
@@ -145,7 +145,7 @@ async function buildReconnectDirective(
     apiHash: state.apiHash,
     authMode: state.authMode,
     phone: state.phone,
-    pendingQrImportTokenBase64Url,
+    qrLoginUrl,
   });
   const dhResult = await startDhExchange(resetState);
   return {
@@ -160,15 +160,28 @@ async function buildReconnectDirective(
 }
 
 async function continueAuthReady(state: SerializedState): Promise<StepResult> {
-  if (state.pendingQrImportTokenBase64Url) {
+  const tokenBase64Url = resolveQrImportToken(state);
+  if (tokenBase64Url) {
     return importLoginToken(state, {
-      tokenBase64Url: state.pendingQrImportTokenBase64Url,
+      tokenBase64Url,
     });
   }
   if (state.authMode === 'qr') {
     return exportQrToken(state);
   }
   return sendCode(state);
+}
+
+function resolveQrImportToken(state: SerializedState): string | null {
+  if (!state.qrLoginUrl) {
+    return null;
+  }
+
+  try {
+    return new URL(state.qrLoginUrl).searchParams.get('token');
+  } catch {
+    return null;
+  }
 }
 
 async function handleInternalAction(
@@ -189,7 +202,14 @@ async function handleInternalAction(
     }
 
     case 'login_qr_scanned': {
-      const followUp = await exportQrToken(state);
+      const tokenBase64Url = resolveQrImportToken(state);
+      if (!tokenBase64Url) {
+        return {
+          nextState: toErrorState(state, 'missing QR import token'),
+        };
+      }
+
+      const followUp = await importLoginToken(state, { tokenBase64Url });
       return {
         nextState: followUp.nextState,
         outbound: followUp.outbound,
@@ -201,7 +221,7 @@ async function handleInternalAction(
         state,
         action.targetDcId,
         'dc_migrate',
-        action.tokenBase64Url,
+        `tg://login?token=${action.tokenBase64Url}`,
       );
       return {
         nextState: transport.nextState,
@@ -214,7 +234,7 @@ async function handleInternalAction(
         state,
         action.targetDcId,
         'dc_migrate',
-        state.pendingQrImportTokenBase64Url,
+        state.qrLoginUrl,
       );
       return {
         nextState: transport.nextState,
@@ -231,9 +251,15 @@ async function handleInternalAction(
             outbound: followUp.outbound,
           };
         }
-        if (state.phase === 'QR_IMPORT_SENT' && state.pendingQrImportTokenBase64Url) {
+        if (state.phase === 'QR_IMPORT_SENT') {
+          const tokenBase64Url = resolveQrImportToken(state);
+          if (!tokenBase64Url) {
+            return {
+              nextState: toErrorState(state, 'missing QR import token'),
+            };
+          }
           const followUp = await importLoginToken(state, {
-            tokenBase64Url: state.pendingQrImportTokenBase64Url,
+            tokenBase64Url,
           });
           return {
             nextState: followUp.nextState,
@@ -247,7 +273,6 @@ async function handleInternalAction(
       if (action.message === 'AUTH_TOKEN_EXPIRED' && state.phase === 'QR_IMPORT_SENT') {
         const refreshed = {
           ...state,
-          pendingQrImportTokenBase64Url: undefined,
           qrLoginUrl: undefined,
           qrExpiresAt: undefined,
         };
@@ -346,7 +371,6 @@ async function refreshQrLogin(
   const refreshedState = state.phase === 'QR_IMPORT_SENT'
     ? {
         ...state,
-        pendingQrImportTokenBase64Url: undefined,
         qrLoginUrl: undefined,
         qrExpiresAt: undefined,
       }

@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "socket-bridge-worker",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "none",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "TELEGRAM_AGENT", "class_name": "TelegramAgent" },
+      { "name": "ZALO_AGENT", "class_name": "ZaloAgent" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["TelegramAgent", "ZaloAgent"] }
+  ],
+  "kv_namespaces": [
+    { "binding": "BRIDGE_KV", "id": "CREATE_ME" }
+  ]
+  // Secrets (wrangler secret put):
+  //   TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_COOKIE_SECRET
+  //   ZALO_SESSION_COOKIE_SECRET
+  //   BRIDGE_URL (Rust bridge URL)
+}

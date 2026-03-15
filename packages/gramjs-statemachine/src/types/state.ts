@@ -70,7 +70,6 @@ export interface SerializedState {
   passwordHint?: string;
   qrLoginUrl?: string;
   qrExpiresAt?: number;
-  pendingQrImportTokenBase64Url?: string;
   passwordSrp?: {
     algoClass: string;
     g: number;
@@ -103,7 +102,6 @@ export function createInitialState(opts: {
   phone?: string;
   qrLoginUrl?: string;
   qrExpiresAt?: number;
-  pendingQrImportTokenBase64Url?: string;
 }): SerializedState {
   return {
     version: 1,
@@ -122,7 +120,6 @@ export function createInitialState(opts: {
     phone: opts.phone,
     qrLoginUrl: opts.qrLoginUrl,
     qrExpiresAt: opts.qrExpiresAt,
-    pendingQrImportTokenBase64Url: opts.pendingQrImportTokenBase64Url,
     pendingRequests: {},
   };
 }

@@ -6,9 +6,8 @@
     "build": "pnpm -r --if-present build",
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
-    "dev:bridge": "pnpm --stream --filter dlkn-socket-bridge-rs run dev",
-    "dev:telegram": "concurrently --kill-others-on-fail --names bridge,telegram \"pnpm --filter dlkn-socket-bridge-rs run dev\" \"pnpm --filter telegram-worker run dev\"",
-    "dev:zalo": "concurrently --kill-others-on-fail --names bridge,zalo \"pnpm --filter dlkn-socket-bridge-rs run dev\" \"pnpm --filter zalo-worker run dev\""
+    "dev:bridge-rs": "pnpm -C packages/dlkn-socket-bridge-rs run dev",
+    "dev:bridge-worker": "concurrently --kill-others-on-fail --names bridge,worker \"pnpm -C packages/dlkn-socket-bridge-rs run dev\" \"pnpm -C examples/socket-bridge-worker run dev\"",
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

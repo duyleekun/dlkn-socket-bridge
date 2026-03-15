@@ -7,8 +7,7 @@ This repo is configured as a `pnpm` workspace so the example apps can consume th
 - `packages/gramjs-statemachine` - Telegram session/state-machine package used by the Telegram example.
 - `packages/zca-js-statemachine` - Zalo session/state-machine package used by the Zalo example.
 - `packages/dlkn-socket-bridge-rs` - Rust package for the socket bridge work.
-- `examples/telegram-worker` - Cloudflare Worker + app example for Telegram.
-- `examples/zalo-worker` - Cloudflare Worker + app example for Zalo.
+- `examples/socket-bridge-worker` - Socket bridge worker example for both Telegram and Zalo.
 
 ## Local development
 
@@ -21,37 +20,24 @@ pnpm install
 Run only the Rust socket bridge:
 
 ```bash
-pnpm dev:bridge
+pnpm dev:bridge-rs
 ```
 
 This runs the Rust bridge through its workspace package wrapper, always in watch mode, and installs `cargo-watch` automatically if needed.
 If `cargo run` fails, the watch session exits immediately instead of waiting for another file change.
 
-Start the Telegram app together with the Rust bridge:
+Start the Socket bridge worker together with the Rust bridge:
 
 ```bash
-pnpm dev:telegram
+pnpm dev:bridge-worker
 ```
 
-This uses `concurrently --kill-others-on-fail` to run both workspace packages with prefixed live logs and fail fast if either process exits.
+This also uses `concurrently --kill-others-on-fail`. The bridge still binds to `127.0.0.1:3000`, while the Socket bridge worker uses Vite's normal dev-server port selection.
 
-This starts:
-
-- bridge uses `BIND_ADDR=127.0.0.1:3000`
-- Telegram dev server uses `--host 127.0.0.1 --port 5173 --strictPort`
-
-Before starting `pnpm dev:telegram`, make sure [examples/telegram-worker/.dev.vars](/Users/duyle/Downloads/workspaces/dlkn-socket-bridge/examples/telegram-worker/.dev.vars) exists with:
+Before starting `pnpm dev:bridge-worker`, make sure [examples/socket-bridge-worker/.dev.vars](/Users/duyle/Downloads/workspaces/dlkn-socket-bridge/examples/socket-bridge-worker/.dev.vars) exists with:
 
 - `TELEGRAM_API_ID`
 - `TELEGRAM_API_HASH`
-
-Start the Zalo app together with the Rust bridge:
-
-```bash
-pnpm dev:zalo
-```
-
-This also uses `concurrently --kill-others-on-fail`. The bridge still binds to `127.0.0.1:3000`, while the Zalo app uses Vite's normal dev-server port selection.
 
 Run builds across the workspace:
 
