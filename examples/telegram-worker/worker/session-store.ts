@@ -1,18 +1,24 @@
 import { createSession } from "./bridge-client";
 import { normalizeUrl, resolveBridgeUrl } from "./bridge-url";
-import { generateNonce, toHex } from "./mtproto/crypto";
 import type {
   BridgeSession,
   Env,
-  PersistedSessionLink,
   PersistedTelegramSession,
-  SocketStatus,
+  TelegramUpdatesState,
 } from "./types";
 import type { SessionSnapshot } from "gramjs-statemachine";
 
 export const SESSION_COOKIE_NAME = "tg_session_ref";
 
-// ── KV key helpers ────────────────────────────────────────────────────────────
+function toHex(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString("hex");
+}
+
+function randomHex(length: number): string {
+  const bytes = new Uint8Array(length);
+  crypto.getRandomValues(bytes);
+  return toHex(bytes);
+}
 
 function serializedStateKey(sessionKey: string): string {
   return `sm-state:${sessionKey}`;
@@ -30,28 +36,11 @@ function persistedSessionKey(persistedSessionRef: string): string {
   return `persisted:${persistedSessionRef}`;
 }
 
-function persistedLinkKey(persistedSessionRef: string): string {
-  return `persisted-link:${persistedSessionRef}`;
-}
-
-// ── In-memory caches (warm for a single Worker instance lifetime) ─────────────
-
-const serializedStateCache = new Map<string, SessionSnapshot>();
-const bridgeSessionCache = new Map<string, BridgeSession>();
-
-// ── State I/O ─────────────────────────────────────────────────────────────────
-
 export async function loadSerializedState(
   env: Env,
   sessionKey: string,
 ): Promise<SessionSnapshot | null> {
-  const state = await env.TG_KV.get<SessionSnapshot>(serializedStateKey(sessionKey), "json");
-  if (state) {
-    serializedStateCache.set(sessionKey, state);
-  } else {
-    serializedStateCache.delete(sessionKey);
-  }
-  return state;
+  return env.TG_KV.get<SessionSnapshot>(serializedStateKey(sessionKey), "json");
 }
 
 export async function saveSerializedState(
@@ -59,7 +48,6 @@ export async function saveSerializedState(
   sessionKey: string,
   state: SessionSnapshot,
 ): Promise<void> {
-  serializedStateCache.set(sessionKey, state);
   await env.TG_KV.put(serializedStateKey(sessionKey), JSON.stringify(state));
 }
 
@@ -67,13 +55,7 @@ export async function loadBridgeSession(
   env: Env,
   sessionKey: string,
 ): Promise<BridgeSession | null> {
-  const bridge = await env.TG_KV.get<BridgeSession>(bridgeSessionKey(sessionKey), "json");
-  if (bridge) {
-    bridgeSessionCache.set(sessionKey, bridge);
-  } else {
-    bridgeSessionCache.delete(sessionKey);
-  }
-  return bridge;
+  return env.TG_KV.get<BridgeSession>(bridgeSessionKey(sessionKey), "json");
 }
 
 export async function saveBridgeSession(
@@ -81,7 +63,6 @@ export async function saveBridgeSession(
   sessionKey: string,
   bridge: BridgeSession,
 ): Promise<void> {
-  bridgeSessionCache.set(sessionKey, bridge);
   await env.TG_KV.put(bridgeSessionKey(sessionKey), JSON.stringify(bridge));
 }
 
@@ -93,11 +74,11 @@ export async function loadBoth(
     loadSerializedState(env, sessionKey),
     loadBridgeSession(env, sessionKey),
   ]);
-  if (!state || !bridge) return null;
+  if (!state || !bridge) {
+    return null;
+  }
   return { state, bridge };
 }
-
-// ── Callback binding ──────────────────────────────────────────────────────────
 
 export async function loadSessionKeyByCallbackKey(
   env: Env,
@@ -118,33 +99,21 @@ export async function deleteCallbackBinding(
   env: Env,
   callbackKey: string | undefined,
 ): Promise<void> {
-  if (!callbackKey) return;
+  if (!callbackKey) {
+    return;
+  }
   await env.TG_KV.delete(callbackBindingKey(callbackKey));
 }
 
-// ── Session lifecycle ─────────────────────────────────────────────────────────
-
-/** Delete both sm-state and bridge-session KV entries for a session. */
 export async function deleteSession(
   env: Env,
   sessionKey: string,
 ): Promise<void> {
-  serializedStateCache.delete(sessionKey);
-  bridgeSessionCache.delete(sessionKey);
   await Promise.all([
     env.TG_KV.delete(serializedStateKey(sessionKey)),
     env.TG_KV.delete(bridgeSessionKey(sessionKey)),
   ]);
 }
-
-export function shouldReuseRuntimeSession(
-  bridge: BridgeSession | null,
-  socketStatus: SocketStatus,
-): boolean {
-  return Boolean(bridge) && socketStatus === "healthy";
-}
-
-// ── Persisted sessions ────────────────────────────────────────────────────────
 
 export async function loadPersistedSession(
   env: Env,
@@ -166,79 +135,43 @@ export async function savePersistedSession(
   );
 }
 
-export async function loadPersistedLink(
-  env: Env,
-  persistedSessionRef: string,
-): Promise<PersistedSessionLink | null> {
-  return env.TG_KV.get<PersistedSessionLink>(
-    persistedLinkKey(persistedSessionRef),
-    "json",
-  );
-}
-
-export async function savePersistedLink(
-  env: Env,
-  record: PersistedSessionLink,
-): Promise<void> {
-  await env.TG_KV.put(
-    persistedLinkKey(record.persistedSessionRef),
-    JSON.stringify(record),
-  );
-}
-
 export async function deletePersistedSessionArtifacts(
   env: Env,
   persistedSessionRef: string,
 ): Promise<void> {
-  await Promise.all([
-    env.TG_KV.delete(persistedSessionKey(persistedSessionRef)),
-    env.TG_KV.delete(persistedLinkKey(persistedSessionRef)),
-  ]);
+  await env.TG_KV.delete(persistedSessionKey(persistedSessionRef));
 }
 
-/**
- * Update the persisted link from bridge metadata and a socket health status.
- */
-export async function updatePersistedLinkFromBridge(
+export async function savePersistedSessionUpdatesState(
   env: Env,
-  sessionKey: string,
-  bridge: BridgeSession,
-  socketHealth: SocketStatus = bridge.socketStatus,
+  persistedSessionRef: string,
+  updatesState: TelegramUpdatesState,
 ): Promise<void> {
-  if (!bridge.persistedSessionRef) return;
-  await savePersistedLink(env, {
-    persistedSessionRef: bridge.persistedSessionRef,
-    liveSessionKey: sessionKey,
-    socketId: bridge.socketId,
-    bridgeUrl: resolveBridgeUrl(bridge.bridgeUrl),
+  const existing = await loadPersistedSession(env, persistedSessionRef);
+  if (!existing) {
+    return;
+  }
+  await savePersistedSession(env, {
+    ...existing,
+    updatesState,
     updatedAt: Date.now(),
-    socketHealth,
   });
 }
 
-/**
- * Persist a ready (authenticated) session:
- * - Saves or updates the PersistedTelegramSession record
- * - Saves a PersistedSessionLink
- * - Updates BridgeSession with persistedSessionRef
- * - Saves both state and bridge back to KV
- *
- * Returns the updated BridgeSession.
- */
 export async function persistReadySession(
   env: Env,
   sessionKey: string,
   state: SessionSnapshot,
   bridge: BridgeSession,
   user?: Record<string, unknown>,
+  updatesState?: TelegramUpdatesState | null,
 ): Promise<BridgeSession> {
   if (!state.context.authKey || !state.context.serverSalt) {
-    throw new Error("cannot persist incomplete Telegram session — missing authKey/serverSalt");
+    throw new Error("cannot persist incomplete Telegram session");
   }
 
   const persistedSessionRef = bridge.persistedSessionRef || crypto.randomUUID();
   const now = Date.now();
-
   const existing = bridge.persistedSessionRef
     ? await loadPersistedSession(env, bridge.persistedSessionRef)
     : null;
@@ -258,6 +191,7 @@ export async function persistReadySession(
     serverSalt: state.context.serverSalt,
     timeOffset: state.context.timeOffset,
     user: user ?? state.context.user,
+    updatesState: updatesState ?? existing?.updatesState,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
@@ -265,30 +199,17 @@ export async function persistReadySession(
   const updatedBridge: BridgeSession = {
     ...bridge,
     persistedSessionRef,
-  };
-
-  const link: PersistedSessionLink = {
-    persistedSessionRef,
-    liveSessionKey: sessionKey,
-    socketId: bridge.socketId,
-    bridgeUrl: resolveBridgeUrl(bridge.bridgeUrl),
-    updatedAt: now,
-    socketHealth: bridge.socketStatus,
+    updatesState: updatesState ?? bridge.updatesState ?? existing?.updatesState,
   };
 
   await Promise.all([
     savePersistedSession(env, record),
-    savePersistedLink(env, link),
     saveBridgeSession(env, sessionKey, updatedBridge),
   ]);
 
   return updatedBridge;
 }
 
-/**
- * Rebuild a new SessionSnapshot + BridgeSession from a persisted session record.
- * Used when resuming an existing authenticated session (cookie restore).
- */
 export async function rebuildSessionFromPersisted(
   env: Env,
   workerUrl: string,
@@ -319,7 +240,7 @@ export async function rebuildSessionFromPersisted(
       authKey: persisted.authKey,
       authKeyId: persisted.authKeyId,
       serverSalt: persisted.serverSalt,
-      sessionId: toHex(generateNonce(8)),
+      sessionId: randomHex(8),
       timeOffset: persisted.timeOffset,
       sequence: 0,
       lastMsgId: "0",
@@ -337,6 +258,7 @@ export async function rebuildSessionFromPersisted(
     socketId: bridgeResp.socket_id,
     bridgeUrl: resolvedBridgeUrl,
     persistedSessionRef: persisted.persistedSessionRef,
+    updatesState: persisted.updatesState,
     socketStatus: "unknown",
   };
 
@@ -346,12 +268,8 @@ export async function rebuildSessionFromPersisted(
     saveCallbackBinding(env, callbackKey, sessionKey),
   ]);
 
-  await updatePersistedLinkFromBridge(env, sessionKey, bridge, "unknown");
-
   return { sessionKey, state, bridge };
 }
-
-// ── Cookie helpers ────────────────────────────────────────────────────────────
 
 function base64UrlEncode(value: Uint8Array): string {
   return Buffer.from(value).toString("base64url");

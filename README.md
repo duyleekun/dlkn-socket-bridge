@@ -25,6 +25,7 @@ pnpm dev:bridge
 ```
 
 This runs the Rust bridge through its workspace package wrapper, always in watch mode, and installs `cargo-watch` automatically if needed.
+If `cargo run` fails, the watch session exits immediately instead of waiting for another file change.
 
 Start the Telegram app together with the Rust bridge:
 
@@ -32,7 +33,7 @@ Start the Telegram app together with the Rust bridge:
 pnpm dev:telegram
 ```
 
-This uses `pnpm --parallel --stream` to run both workspace packages with prefixed live logs.
+This uses `concurrently --kill-others-on-fail` to run both workspace packages with prefixed live logs and fail fast if either process exits.
 
 This starts:
 
@@ -50,7 +51,7 @@ Start the Zalo app together with the Rust bridge:
 pnpm dev:zalo
 ```
 
-This also uses `pnpm --parallel --stream`. The bridge still binds to `127.0.0.1:3000`, while the Zalo app uses Vite's normal dev-server port selection.
+This also uses `concurrently --kill-others-on-fail`. The bridge still binds to `127.0.0.1:3000`, while the Zalo app uses Vite's normal dev-server port selection.
 
 Run builds across the workspace:
 

@@ -20,6 +20,10 @@ import {
 import { createInitialState } from '../src/types/state.js';
 import { step } from '../src/step.js';
 import {
+  getTlObjectClassName,
+  parseRpcResultFrame,
+} from '../src/dispatch/inbound-dispatch.js';
+import {
   aesIgeDecrypt,
   aesIgeEncrypt,
   decryptMessage,
@@ -151,6 +155,14 @@ async function buildInboundServerEnvelopeWithGramJs(opts: {
   );
 }
 
+function createAlignedPadding(bodyLength: number, minimum = 12): Uint8Array {
+  let paddingLength = minimum;
+  while ((32 + bodyLength + paddingLength) % 16 !== 0) {
+    paddingLength += 1;
+  }
+  return new Uint8Array(paddingLength);
+}
+
 const NULL_LOGGER = {
   debug() {},
   info() {},
@@ -186,7 +198,9 @@ describe('GramJS internal compatibility', () => {
     const sender = new MTProtoPlainSender(
       connection as unknown as ConstructorParameters<typeof MTProtoPlainSender>[0],
       NULL_LOGGER,
-    ) as MTProtoPlainSender & { _state: { _getNewMsgId: () => ReturnType<typeof bigInt> } };
+    ) as MTProtoPlainSender & {
+      _state: { _getNewMsgId: () => ReturnType<typeof bigInt> };
+    };
 
     sender._state._getNewMsgId = () => bigInt('7301444403200000000');
     await sender.send(new Api.ReqPqMulti({ nonce }));
@@ -237,6 +251,32 @@ describe('GramJS internal compatibility', () => {
 
     assert.equal(packed.constructor.name.replace(/^_+/, ''), 'GZIPPacked');
     assert.equal(Buffer.from(packed.data).toString('hex'), Buffer.from(inner).toString('hex'));
+  });
+
+  it('parseRpcResultFrame unwraps gzipped RPC result bodies', async () => {
+    const inner = new Api.Pong({ msgId: bigInt(11), pingId: bigInt(22) }).getBytes();
+    const constructor = Buffer.alloc(4);
+    constructor.writeUInt32LE(GZIPPacked.CONSTRUCTOR_ID, 0);
+    const packet = Buffer.concat([
+      constructor,
+      serializeBytes(deflateSync(Buffer.from(inner))),
+    ]);
+
+    const parsed = await parseRpcResultFrame(
+      {
+        className: 'RPCResult',
+        reqMsgId: 12345n,
+        body: new Uint8Array(packet),
+      },
+      { requestName: 'Ping' },
+    );
+
+    assert.equal(parsed?.resultClassName, 'Pong');
+    assert.deepEqual(parsed?.normalizedResult, {
+      className: 'Pong',
+      msgId: { className: 'Integer', value: '11' },
+      pingId: { className: 'Integer', value: '22' },
+    });
   });
 
   it('deriveAesKeyIv matches GramJS _calcKey for both traffic directions', async () => {
@@ -319,6 +359,30 @@ describe('GramJS internal compatibility', () => {
       Buffer.from(decrypted.body).toString('hex'),
       request.getBytes().toString('hex'),
     );
+  });
+
+  it('step emits an unpacked decrypted frame for top-level GZIPPacked messages', async () => {
+    const inner = new Api.Pong({ msgId: bigInt(33), pingId: bigInt(44) }).getBytes();
+    const constructor = Buffer.alloc(4);
+    constructor.writeUInt32LE(GZIPPacked.CONSTRUCTOR_ID, 0);
+    const packet = Buffer.concat([
+      constructor,
+      serializeBytes(deflateSync(Buffer.from(inner))),
+    ]);
+
+    const encrypted = await buildInboundServerEnvelopeWithGramJs({
+      msgId: 0x6554433221100008n,
+      seqNo: 2,
+      body: new Uint8Array(packet),
+      padding: createAlignedPadding(packet.length),
+    });
+
+    const result = await step(
+      createSerializedSessionState(),
+      wrapTransportFrame(encrypted),
+    );
+
+    assert.equal(getTlObjectClassName(result.decryptedFrame?.object), 'Pong');
   });
 
   it('sendApiRequest stays in lockstep with GramJS sequence and msg ids', async () => {

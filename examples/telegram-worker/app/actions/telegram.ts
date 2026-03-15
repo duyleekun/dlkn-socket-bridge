@@ -18,20 +18,16 @@ import {
   probeBridgeSocket,
 } from "../../worker/socket-health";
 import {
-  Api,
-  randomLong,
-  createSession as createTelegramSession,
+  buildTelegramGetDifferenceParams,
   invokeSessionMethod,
+  createSession as createTelegramSession,
   selectSessionView,
   transitionSession,
 } from "gramjs-statemachine";
 import type { ApiMethodPath, SessionSnapshot } from "gramjs-statemachine";
-import { buildInputPeerFromConversation } from "../../worker/inbound";
 import {
   clearRuntimeArtifacts,
-  loadConversationCache,
   loadPacketLog,
-  trackPendingRequest,
 } from "../../worker/runtime-store";
 import {
   SESSION_COOKIE_NAME,
@@ -42,23 +38,21 @@ import {
   encryptCookieValue,
   loadBoth,
   loadBridgeSession,
-  loadPersistedLink,
   loadPersistedSession,
   loadSerializedState,
   rebuildSessionFromPersisted,
   saveBridgeSession,
   saveCallbackBinding,
   saveSerializedState,
-  shouldReuseRuntimeSession,
 } from "../../worker/session-store";
 import type {
   BridgeSession,
   BridgeSocketHealth,
-  ConversationCache,
   Env,
   ParsedPacketEntry,
   TelegramAuthMode,
   TelegramDcMode,
+  TelegramUpdatesState,
 } from "../../worker/types";
 
 function getEnv(): Env {
@@ -103,7 +97,12 @@ async function clearPersistedSessionCookie(): Promise<void> {
   store.delete(SESSION_COOKIE_NAME);
 }
 
-function toStatusPayload(state: SessionSnapshot, bridge: BridgeSession) {
+async function toStatusPayload(
+  env: Env,
+  sessionKey: string,
+  state: SessionSnapshot,
+  bridge: BridgeSession,
+) {
   const view = selectSessionView(state);
   return {
     view,
@@ -111,6 +110,82 @@ function toStatusPayload(state: SessionSnapshot, bridge: BridgeSession) {
     socketStatus: bridge.socketStatus,
     socketLastCheckedAt: bridge.socketLastCheckedAt,
     socketLastHealthyAt: bridge.socketLastHealthyAt,
+    updatesState: bridge.updatesState ?? null,
+  };
+}
+
+async function loadStatusPayload(
+  env: Env,
+  sessionKey: string,
+) {
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded) {
+    return null;
+  }
+  return toStatusPayload(env, sessionKey, loaded.state, loaded.bridge);
+}
+
+async function waitForUpdatesStateChange(
+  env: Env,
+  sessionKey: string,
+  previousUpdatedAt: number,
+  timeoutMs = 3000,
+): Promise<TelegramUpdatesState | null> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const updatesState = (await loadBridgeSession(env, sessionKey))?.updatesState ?? null;
+    if (updatesState && updatesState.updatedAt > previousUpdatedAt) {
+      return updatesState;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return (await loadBridgeSession(env, sessionKey))?.updatesState ?? null;
+}
+
+async function invokeReadySessionMethod(
+  env: Env,
+  sessionKey: string,
+  method: ApiMethodPath,
+  params: Record<string, unknown> | undefined,
+) {
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded || loaded.state.value !== "ready") {
+    return { error: "not_ready" as const };
+  }
+  const { state, bridge } = loaded;
+  const beforeUpdatedAt = bridge.updatesState?.updatedAt ?? 0;
+
+  const result = await invokeSessionMethod(
+    state,
+    method,
+    params as never,
+  );
+  const msgId = result.snapshot.context.lastMsgId;
+  await persistStateAndExecute(
+    env,
+    "",
+    sessionKey,
+    bridge,
+    result.snapshot,
+    result.commands,
+  );
+
+  const updatesState = await waitForUpdatesStateChange(
+    env,
+    sessionKey,
+    beforeUpdatedAt,
+  );
+  const status = await loadStatusPayload(env, sessionKey);
+  if (!status) {
+    return { error: "not_found" as const };
+  }
+
+  return {
+    ok: true as const,
+    msgId,
+    status,
+    updatesState,
+    updated: Boolean(updatesState && updatesState.updatedAt > beforeUpdatedAt),
   };
 }
 
@@ -136,22 +211,11 @@ export async function startAuth(input: {
     phone: authMode === "phone" ? input.phone : undefined,
   });
 
-  // Create bridge socket
   const bridgeResp = await createBridgeSession(
     resolvedBridgeUrl,
     `mtproto-frame://${initial.snapshot.context.dcIp}:${initial.snapshot.context.dcPort}`,
     `${normalizedWorkerUrl}/cb/${callbackKey}`,
   );
-  console.debug('[telegram.startAuth] initial DH request ready', {
-    sessionKey,
-    authMode,
-    dcMode,
-    dcId: initial.snapshot.context.dcId,
-    target: `${initial.snapshot.context.dcIp}:${initial.snapshot.context.dcPort}`,
-    commandCount: initial.commands.length,
-    nextState: initial.snapshot.value,
-    protocolPhase: initial.snapshot.context.protocolPhase,
-  });
 
   const bridge: BridgeSession = {
     sessionKey,
@@ -161,7 +225,6 @@ export async function startAuth(input: {
     socketStatus: "unknown",
   };
 
-  // Persist state + bridge + callback binding
   await Promise.all([
     saveSerializedState(env, sessionKey, initial.snapshot),
     saveBridgeSession(env, sessionKey, bridge),
@@ -178,7 +241,7 @@ export async function startAuth(input: {
 
   return {
     sessionKey,
-    ...toStatusPayload(initial.snapshot, bridge),
+    ...(await toStatusPayload(env, sessionKey, initial.snapshot, bridge)),
   };
 }
 
@@ -192,7 +255,7 @@ export async function getStatus(sessionKey: string) {
   if (state.value === "ready" && bridge.persistedSessionRef) {
     await writePersistedSessionCookie(env, bridge.persistedSessionRef);
   }
-  return toStatusPayload(state, bridge);
+  return toStatusPayload(env, sessionKey, state, bridge);
 }
 
 export async function submitCode(sessionKey: string, code: string) {
@@ -219,7 +282,7 @@ export async function submitCode(sessionKey: string, code: string) {
     result.commands,
   );
 
-  return toStatusPayload(result.snapshot, bridge);
+  return toStatusPayload(env, sessionKey, result.snapshot, bridge);
 }
 
 export async function submitPassword(sessionKey: string, password: string) {
@@ -246,7 +309,7 @@ export async function submitPassword(sessionKey: string, password: string) {
     result.commands,
   );
 
-  return toStatusPayload(result.snapshot, bridge);
+  return toStatusPayload(env, sessionKey, result.snapshot, bridge);
 }
 
 export async function refreshQrToken(sessionKey: string) {
@@ -272,7 +335,7 @@ export async function refreshQrToken(sessionKey: string) {
     result.commands,
   );
 
-  return toStatusPayload(result.snapshot, bridge);
+  return toStatusPayload(env, sessionKey, result.snapshot, bridge);
 }
 
 export async function restoreSessionFromCookie(
@@ -292,55 +355,39 @@ export async function restoreSessionFromCookie(
     return { restored: false as const };
   }
 
-  const link = await loadPersistedLink(env, persistedSessionRef);
-  if (link?.liveSessionKey) {
-    const liveBridge = await loadBridgeSession(env, link.liveSessionKey);
-    const liveState = await loadSerializedState(env, link.liveSessionKey);
-    if (liveBridge) {
-      const health = await probeBridgeSocket(env, link.liveSessionKey, liveBridge);
-      if (shouldReuseRuntimeSession(liveBridge, health.status)) {
-        await writePersistedSessionCookie(env, persistedSessionRef);
-        const refreshedBridge = await loadBridgeSession(env, link.liveSessionKey);
-        const refreshedState = await loadSerializedState(env, link.liveSessionKey);
-        const b = refreshedBridge || liveBridge;
-        const s = refreshedState || liveState;
-        if (s) {
-          return {
-            restored: true as const,
-            sessionKey: link.liveSessionKey,
-            health,
-            ...toStatusPayload(s, b),
-          };
-        }
-      }
-    }
-
-    // Stale — clean up the live session
-    if (link.socketId) {
-      await cleanupSocket(link.bridgeUrl, link.socketId);
-    }
-    if (liveBridge?.callbackKey) {
-      await deleteCallbackBinding(env, liveBridge.callbackKey);
-    }
-    await deleteSession(env, link.liveSessionKey);
-    await clearRuntimeArtifacts(env, link.liveSessionKey);
-  }
-
   const rebuilt = await rebuildSessionFromPersisted(
     env,
     normalizeUrl(workerUrl || ""),
     persisted,
     bridgeUrl,
   );
+  const bootstrap = await invokeSessionMethod(
+    rebuilt.state,
+    "help.GetConfig",
+    undefined as never,
+  );
+  await persistStateAndExecute(
+    env,
+    "",
+    rebuilt.sessionKey,
+    rebuilt.bridge,
+    bootstrap.snapshot,
+    bootstrap.commands,
+  );
   const health = await probeBridgeSocket(env, rebuilt.sessionKey, rebuilt.bridge);
   await writePersistedSessionCookie(env, persistedSessionRef);
   const restoredBridge = await loadBridgeSession(env, rebuilt.sessionKey) || rebuilt.bridge;
-  const restoredState = await loadSerializedState(env, rebuilt.sessionKey) || rebuilt.state;
+  const restoredState = await loadSerializedState(env, rebuilt.sessionKey) || bootstrap.snapshot;
   return {
     restored: true as const,
     sessionKey: rebuilt.sessionKey,
     health,
-    ...toStatusPayload(restoredState, restoredBridge),
+    ...(await toStatusPayload(
+      env,
+      rebuilt.sessionKey,
+      restoredState,
+      restoredBridge,
+    )),
   };
 }
 
@@ -365,16 +412,6 @@ export async function logoutSession(sessionKey?: string) {
   }
 
   if (persistedSessionRef) {
-    const link = await loadPersistedLink(env, persistedSessionRef);
-    if (link?.socketId) {
-      await cleanupSocket(link.bridgeUrl, link.socketId);
-    }
-    if (link?.liveSessionKey && link.liveSessionKey !== sessionKey) {
-      const linkedBridge = await loadBridgeSession(env, link.liveSessionKey);
-      await deleteCallbackBinding(env, linkedBridge?.callbackKey);
-      await deleteSession(env, link.liveSessionKey);
-      await clearRuntimeArtifacts(env, link.liveSessionKey);
-    }
     await deletePersistedSessionArtifacts(env, persistedSessionRef);
   }
 
@@ -393,6 +430,47 @@ export async function getBridgeSocketHealth(
   return probeBridgeSocket(env, sessionKey, bridge);
 }
 
+export async function getTelegramUpdatesState(
+  sessionKey: string,
+): Promise<TelegramUpdatesState | { error: "not_found" }> {
+  const env = getEnv();
+  const bridge = await loadBridgeSession(env, sessionKey);
+  if (!bridge) {
+    return { error: "not_found" as const };
+  }
+  return bridge.updatesState || {
+    error: "not_found" as const,
+  };
+}
+
+export async function telegramGetState(sessionKey: string) {
+  const env = getEnv();
+  return invokeReadySessionMethod(
+    env,
+    sessionKey,
+    "updates.GetState",
+    undefined,
+  );
+}
+
+export async function telegramGetDifference(sessionKey: string) {
+  const env = getEnv();
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded || loaded.state.value !== "ready") {
+    return { error: "not_ready" as const };
+  }
+  const updatesState = loaded.bridge.updatesState;
+  if (!updatesState) {
+    return { error: "missing_updates_state" as const };
+  }
+  return invokeReadySessionMethod(
+    env,
+    sessionKey,
+    "updates.GetDifference",
+    buildTelegramGetDifferenceParams(updatesState),
+  );
+}
+
 export async function sendTelegramMethod(
   sessionKey: string,
   method: string,
@@ -405,7 +483,6 @@ export async function sendTelegramMethod(
   }
   const { state, bridge } = loaded;
 
-  const requestId = crypto.randomUUID();
   let result;
   try {
     result = await invokeSessionMethod(
@@ -422,8 +499,8 @@ export async function sendTelegramMethod(
   if (!result) {
     return { error: "unknown_method" as const };
   }
-  const msgId = result.snapshot.context.lastMsgId;
 
+  const msgId = result.snapshot.context.lastMsgId;
   await persistStateAndExecute(
     env,
     "",
@@ -431,26 +508,9 @@ export async function sendTelegramMethod(
     bridge,
     result.snapshot,
     result.commands,
-    [
-      trackPendingRequest(env, sessionKey, msgId, {
-        requestId,
-        kind: "generic",
-        method,
-        createdAt: Date.now(),
-      }),
-    ],
   );
 
-  return { requestId };
-}
-
-export async function getResult(sessionKey: string, requestId: string) {
-  const env = getEnv();
-  const result = await env.TG_KV.get(
-    `result:${sessionKey}:${requestId}`,
-    "json",
-  );
-  return result || { pending: true as const };
+  return { ok: true as const, msgId };
 }
 
 export async function getPacketLog(
@@ -462,111 +522,6 @@ export async function getPacketLog(
     return { error: "not_found" as const };
   }
   return loadPacketLog(env, sessionKey);
-}
-
-export async function getConversations(
-  sessionKey: string,
-): Promise<ConversationCache | { error: "not_found" }> {
-  const env = getEnv();
-  const bridge = await loadBridgeSession(env, sessionKey);
-  if (!bridge) {
-    return { error: "not_found" as const };
-  }
-  return (await loadConversationCache(env, sessionKey)) || { items: [], updatedAt: 0 };
-}
-
-export async function refreshConversations(sessionKey: string) {
-  const env = getEnv();
-  const loaded = await loadBoth(env, sessionKey);
-  if (!loaded || loaded.state.value !== "ready") {
-    return { error: "not_ready" as const };
-  }
-  const { state, bridge } = loaded;
-
-  const requestId = crypto.randomUUID();
-  const result = await invokeSessionMethod(
-    state,
-    "messages.GetDialogs",
-    {
-      offsetDate: 0,
-      offsetId: 0,
-      offsetPeer: new Api.InputPeerEmpty(),
-      limit: 20,
-      hash: 0n,
-    },
-  );
-  const msgId = result.snapshot.context.lastMsgId;
-
-  await persistStateAndExecute(
-    env,
-    "",
-    sessionKey,
-    bridge,
-    result.snapshot,
-    result.commands,
-    [
-      trackPendingRequest(env, sessionKey, msgId, {
-        requestId,
-        kind: "dialogs",
-        method: "messages.GetDialogs",
-        createdAt: Date.now(),
-      }),
-    ],
-  );
-
-  return { requestId };
-}
-
-export async function sendConversationMessage(
-  sessionKey: string,
-  conversationId: string,
-  text: string,
-) {
-  const env = getEnv();
-  const loaded = await loadBoth(env, sessionKey);
-  if (!loaded || loaded.state.value !== "ready") {
-    return { error: "not_ready" as const };
-  }
-  const { state, bridge } = loaded;
-
-  const cache = await loadConversationCache(env, sessionKey);
-  const conversation = cache?.items.find((item) => item.id === conversationId);
-  if (!conversation) {
-    return { error: "conversation_not_found" as const };
-  }
-
-  const requestId = crypto.randomUUID();
-  const inputPeer = buildInputPeerFromConversation(conversation);
-  const result = await invokeSessionMethod(
-    state,
-    "messages.SendMessage",
-    {
-      peer: inputPeer,
-      message: text.trim(),
-      randomId: await randomLong(),
-      noWebpage: true,
-    },
-  );
-  const msgId = result.snapshot.context.lastMsgId;
-
-  await persistStateAndExecute(
-    env,
-    "",
-    sessionKey,
-    bridge,
-    result.snapshot,
-    result.commands,
-    [
-      trackPendingRequest(env, sessionKey, msgId, {
-        requestId,
-        kind: "send_message",
-        method: "messages.SendMessage",
-        createdAt: Date.now(),
-      }),
-    ],
-  );
-
-  return { requestId };
 }
 
 export async function closeCurrentSocket(sessionKey: string) {

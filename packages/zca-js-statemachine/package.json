@@ -17,12 +17,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "pako": "^2.1.0",
-    "robot3": "^1.2.0"
+    "robot3": "^1.2.0",
+    "zca-js": "2.1.1"
   },
   "devDependencies": {
     "@types/node": "^22",
-    "@types/pako": "^2.0.4",
     "tsx": "^4.20.6",
     "typescript": "^5"
   }

@@ -10,12 +10,17 @@ import {
   recoverBridgeSession,
   logoutSession,
   getMessageLog,
+  getSocketActivityLog,
   initiateQRLogin,
   sendZaloMessage,
+  fetchMissingZaloEvents,
 } from "../actions/zalo";
 import type { StatusData } from "../actions/zalo";
 import { DEFAULT_BRIDGE_URL } from "../../worker/bridge-url";
-import type { ZaloMessage } from "../../worker/types";
+import {
+  readZaloMessage,
+  type SocketActivityEntry,
+} from "../../worker/types";
 import type { BridgeSocketHealth } from "../../worker/socket-health";
 import {
   deriveAuthStep,
@@ -32,6 +37,26 @@ function statusBadgeClasses(status?: RecoverySocketStatus): string {
     return "bg-green-100 text-green-700";
   }
   return "bg-red-100 text-red-700";
+}
+
+function activityDirectionClasses(direction: "rx" | "tx"): string {
+  return direction === "rx"
+    ? "bg-emerald-100 text-emerald-700"
+    : "bg-blue-100 text-blue-700";
+}
+
+function activityTypeClasses(type: string): string {
+  if (type === "unknown") return "bg-amber-100 text-amber-800";
+  if (type === "frame") return "bg-slate-100 text-slate-600";
+  if (type === "message") return "bg-slate-100 text-slate-700";
+  return "bg-violet-100 text-violet-700";
+}
+
+function payloadKindClasses(payloadKind?: "decrypted" | "wrapper" | "raw"): string {
+  if (payloadKind === "decrypted") return "bg-green-100 text-green-700";
+  if (payloadKind === "wrapper") return "bg-amber-100 text-amber-800";
+  if (payloadKind === "raw") return "bg-slate-100 text-slate-600";
+  return "bg-slate-100 text-slate-600";
 }
 
 function createErrorState(message: string): StatusData {
@@ -54,7 +79,7 @@ export default function ZaloAuth() {
   const [status, setStatus] = useState<StatusData | null>(null);
   const [qrImage, setQrImage] = useState("");
   const [qrExpiresAt, setQrExpiresAt] = useState<number | null>(null);
-  const [messages, setMessages] = useState<ZaloMessage[]>([]);
+  const [socketActivity, setSocketActivity] = useState<SocketActivityEntry[]>([]);
   const [socketHealth, setSocketHealth] = useState<BridgeSocketHealth | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
   const [selfMessage, setSelfMessage] = useState("Self-test from Zalo Worker UI");
@@ -63,11 +88,16 @@ export default function ZaloAuth() {
     kind: "success" | "error";
     message: string;
   } | null>(null);
+  const [fetchMissingInProgress, setFetchMissingInProgress] = useState(false);
+  const [fetchMissingStatus, setFetchMissingStatus] = useState<{
+    kind: "success" | "error";
+    message: string;
+  } | null>(null);
   const [restoring, setRestoring] = useState(true);
   const [recoveringBridge, setRecoveringBridge] = useState(false);
   const [loginInProgress, setLoginInProgress] = useState(false);
-  const messagesScrollRef = useRef<HTMLDivElement>(null);
-  const pendingAutoScrollRef = useRef(false);
+  const socketActivityScrollRef = useRef<HTMLDivElement>(null);
+  const pendingSocketActivityAutoScrollRef = useRef(false);
   const loginTriggeredRef = useRef(false);
 
   const step = deriveAuthStep(status);
@@ -89,17 +119,17 @@ export default function ZaloAuth() {
   const userProfile = status?.view.userProfile;
 
   function shouldStickMessageListToBottom(): boolean {
-    const container = messagesScrollRef.current;
+    const container = socketActivityScrollRef.current;
     if (!container) return false;
     const distanceFromBottom =
       container.scrollHeight - container.scrollTop - container.clientHeight;
     return distanceFromBottom <= 48;
   }
 
-  function replaceMessages(nextMessages: ZaloMessage[]): void {
-    pendingAutoScrollRef.current =
-      nextMessages.length > messages.length && shouldStickMessageListToBottom();
-    setMessages(nextMessages);
+  function replaceSocketActivity(nextActivity: SocketActivityEntry[]): void {
+    pendingSocketActivityAutoScrollRef.current =
+      nextActivity.length > socketActivity.length && shouldStickMessageListToBottom();
+    setSocketActivity(nextActivity);
   }
 
   async function resolveSelfSendOutcome(
@@ -108,20 +138,23 @@ export default function ZaloAuth() {
   ): Promise<boolean> {
     if (!sessionKey) return false;
     const log = await getMessageLog(sessionKey);
-    pendingAutoScrollRef.current = true;
-    replaceMessages(log);
+    pendingSocketActivityAutoScrollRef.current = true;
+    const activity = await getSocketActivityLog(sessionKey);
+    replaceSocketActivity(activity);
     const now = Date.now();
     const matched = [...log].reverse().find(
-      (message) =>
-        message.content === expectedText &&
-        now - message.timestamp < 30_000,
+      (message) => {
+        const entry = readZaloMessage(message);
+        return entry.content === expectedText && now - entry.timestamp < 30_000;
+      },
     );
     if (!matched) return false;
+    const entry = readZaloMessage(matched);
     setSendStatus({
       kind: "success",
       message:
-        matched.id && matched.id !== "0"
-          ? `${fallbackMessage} Message id: ${matched.id}`
+        entry.id !== "0"
+          ? `${fallbackMessage} Message id: ${entry.id}`
           : fallbackMessage,
     });
     setSelfMessage("Self-test from Zalo Worker UI");
@@ -129,15 +162,15 @@ export default function ZaloAuth() {
   }
 
   useEffect(() => {
-    if (!pendingAutoScrollRef.current) return;
-    const container = messagesScrollRef.current;
+    if (!pendingSocketActivityAutoScrollRef.current) return;
+    const container = socketActivityScrollRef.current;
     if (!container) return;
     container.scrollTo({
       top: container.scrollHeight,
       behavior: "smooth",
     });
-    pendingAutoScrollRef.current = false;
-  }, [messages]);
+    pendingSocketActivityAutoScrollRef.current = false;
+  }, [socketActivity]);
 
   useEffect(() => {
     let cancelled = false;
@@ -210,14 +243,14 @@ export default function ZaloAuth() {
   }, [sessionKey, step, bridgeUrl, loginInProgress]);
 
   useEffect(() => {
-    if (!sessionKey || step !== "listening") return;
+    if (!sessionKey || (step !== "socket_connecting" && step !== "listening")) return;
     const interval = setInterval(async () => {
-      const log = await getMessageLog(sessionKey);
-      replaceMessages(log);
+      const activity = await getSocketActivityLog(sessionKey);
+      replaceSocketActivity(activity);
     }, 1000);
-    void getMessageLog(sessionKey).then(replaceMessages);
+    void getSocketActivityLog(sessionKey).then(replaceSocketActivity);
     return () => clearInterval(interval);
-  }, [sessionKey, step, messages.length]);
+  }, [sessionKey, step, socketActivity.length]);
 
   useEffect(() => {
     if (!sessionKey || (step !== "socket_connecting" && step !== "listening")) return;
@@ -249,7 +282,7 @@ export default function ZaloAuth() {
       setSessionKey(result.sessionKey);
       setQrImage("");
       setQrExpiresAt(null);
-      setMessages([]);
+      setSocketActivity([]);
       setSocketHealth(null);
       setStatus({
         phase: "qr_connecting",
@@ -272,11 +305,12 @@ export default function ZaloAuth() {
     setStatus(null);
     setQrImage("");
     setQrExpiresAt(null);
-    setMessages([]);
+    setSocketActivity([]);
     setSocketHealth(null);
     setErrorMsg("");
     setSelfMessage("Self-test from Zalo Worker UI");
     setSendStatus(null);
+    setFetchMissingStatus(null);
     setSendInProgress(false);
     loginTriggeredRef.current = false;
     setLoginInProgress(false);
@@ -304,9 +338,9 @@ export default function ZaloAuth() {
       setSessionKey(recovered.sessionKey);
       setStatus(recovered);
       setSocketHealth(recovered.health ?? null);
-      const log = await getMessageLog(recovered.sessionKey);
-      pendingAutoScrollRef.current = true;
-      replaceMessages(log);
+      const activity = await getSocketActivityLog(recovered.sessionKey);
+      pendingSocketActivityAutoScrollRef.current = true;
+      replaceSocketActivity(activity);
     } catch (error) {
       setErrorMsg(error instanceof Error ? error.message : String(error));
       setStatus(
@@ -360,9 +394,9 @@ export default function ZaloAuth() {
           : "Sent to your own UID.",
       });
       setSelfMessage("Self-test from Zalo Worker UI");
-      pendingAutoScrollRef.current = true;
-      const log = await getMessageLog(sessionKey);
-      replaceMessages(log);
+      pendingSocketActivityAutoScrollRef.current = true;
+      const activity = await getSocketActivityLog(sessionKey);
+      replaceSocketActivity(activity);
     } catch (error) {
       if (
         await resolveSelfSendOutcome(
@@ -379,6 +413,118 @@ export default function ZaloAuth() {
     } finally {
       setSendInProgress(false);
     }
+  }
+
+  async function handleFetchMissingEvents() {
+    if (!sessionKey || fetchMissingInProgress) return;
+
+    setFetchMissingInProgress(true);
+    setFetchMissingStatus(null);
+    setErrorMsg("");
+
+    try {
+      const result = await fetchMissingZaloEvents(sessionKey);
+      if (!result.ok) {
+        setFetchMissingStatus({
+          kind: "error",
+          message: result.error || "Failed to request missing Zalo events.",
+        });
+        return;
+      }
+
+      const requested = [
+        result.requestedDm ? "DM" : null,
+        result.requestedGroup ? "group" : null,
+      ].filter(Boolean).join(" + ");
+
+      setFetchMissingStatus({
+        kind: "success",
+        message: `Requested missing ${requested} history from the current recovery cursors.`,
+      });
+      pendingSocketActivityAutoScrollRef.current = true;
+      const activity = await getSocketActivityLog(sessionKey);
+      replaceSocketActivity(activity);
+    } catch (error) {
+      setFetchMissingStatus({
+        kind: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setFetchMissingInProgress(false);
+    }
+  }
+
+  function renderSocketActivityPanel() {
+    return (
+      <div className="space-y-3 pt-2 border-t border-gray-200">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-sm font-semibold">Socket Activity</h2>
+          <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
+            {socketActivity.length} event{socketActivity.length === 1 ? "" : "s"}
+          </span>
+        </div>
+        {socketActivity.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-gray-300 p-3 text-xs text-gray-500">
+            No socket activity yet. Waiting for TX or RX frames...
+          </div>
+        ) : (
+          <div
+            ref={socketActivityScrollRef}
+            className="space-y-2 max-h-72 overflow-y-auto"
+          >
+            {socketActivity.map((entry) => (
+              <div
+                key={entry.id}
+                className="rounded-lg border border-gray-200 bg-white p-3 text-xs text-slate-900 shadow-sm"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-[11px] font-medium uppercase ${activityDirectionClasses(entry.direction)}`}
+                    >
+                      {entry.direction}
+                    </span>
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${activityTypeClasses(entry.type)}`}
+                    >
+                      {entry.type}
+                    </span>
+                    <span className="font-mono text-[11px] text-slate-500">
+                      bytes={entry.bytes}
+                      {typeof entry.cmd === "number" ? ` cmd=${entry.cmd}` : ""}
+                      {typeof entry.subCmd === "number" ? ` sub=${entry.subCmd}` : ""}
+                    </span>
+                    {entry.payloadKind && (
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${payloadKindClasses(entry.payloadKind)}`}
+                      >
+                        {entry.payloadKind}
+                      </span>
+                    )}
+                  </div>
+                  <span className="shrink-0 text-slate-500">
+                    {new Date(entry.timestamp).toLocaleTimeString()}
+                  </span>
+                </div>
+                {entry.recovered && (
+                  <p className="mt-2 inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
+                    Recovered while offline
+                  </p>
+                )}
+                <p className="mt-2 whitespace-pre-wrap break-words text-sm text-slate-700">
+                  {entry.summary}
+                </p>
+                {entry.details && (
+                  <p className="mt-2 break-all font-mono text-[11px] text-slate-500">
+                    {entry.details}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
   }
 
   return (
@@ -581,6 +727,8 @@ export default function ZaloAuth() {
                 </div>
               </div>
             )}
+
+            {renderSocketActivityPanel()}
           </div>
         )}
 
@@ -614,61 +762,42 @@ export default function ZaloAuth() {
                 </p>
               )}
             </div>
-
-            <div className="space-y-3 pt-2 border-t border-gray-200">
-              <div className="flex items-center justify-between gap-3">
-                <h2 className="text-sm font-semibold">Message Activity</h2>
-                <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs text-gray-600">
-                  {messages.length} message{messages.length === 1 ? "" : "s"}
-                </span>
-              </div>
-              {messages.length === 0 ? (
-                <div className="rounded-lg border border-dashed border-gray-300 p-3 text-xs text-gray-500">
-                  No messages yet. Waiting for incoming messages...
-                </div>
-              ) : (
-                <div
-                  ref={messagesScrollRef}
-                  className="space-y-2 max-h-72 overflow-y-auto"
-                >
-                  {messages.map((msg) => (
-                    <div
-                      key={msg.id}
-                      className="rounded-lg border border-gray-200 bg-white p-3 text-xs text-slate-900 shadow-sm"
-                    >
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="min-w-0">
-                          <p className="font-semibold truncate">
-                            {msg.fromId === "0"
-                              ? userProfile?.displayName || "You"
-                              : msg.fromId}
-                          </p>
-                          <p className="mt-1 break-all font-mono text-[11px] text-slate-500">
-                            thread={msg.threadId} type={msg.threadType}
-                            {msg.msgType ? ` msgType=${msg.msgType}` : ""}
-                          </p>
-                        </div>
-                        <span className="shrink-0 text-slate-500">
-                          {new Date(msg.timestamp).toLocaleTimeString()}
-                        </span>
-                      </div>
-                      {msg.recovered && (
-                        <p className="mt-2 inline-flex rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-700">
-                          Recovered while offline
-                        </p>
-                      )}
-                      <p className="mt-2 whitespace-pre-wrap break-words text-sm text-slate-700">
-                        {msg.content || "(empty message payload)"}
-                      </p>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
+            {renderSocketActivityPanel()}
 
             {outboundPanelState === "disabled" && (
-              <div className="space-y-3 pt-2 border-t border-gray-200">
-                <h2 className="text-sm font-semibold">Outbound Messaging</h2>
+              <div className="space-y-4 pt-2 border-t border-gray-200">
+                <div className="space-y-3">
+                  <h2 className="text-sm font-semibold">Fetch Missing Events</h2>
+                  <div className="rounded-lg border border-gray-200 bg-slate-50 p-4 space-y-3">
+                    <p className="text-sm text-slate-700">
+                      Request Zalo old-message recovery for both direct and group threads using the latest IDs already tracked by the worker.
+                    </p>
+                    <p className="text-xs text-slate-500">
+                      This uses the `zca-js` recovery frames already exposed by the socket protocol: DM `cmd=510` and group `cmd=511`.
+                    </p>
+                    <button
+                      onClick={handleFetchMissingEvents}
+                      disabled={fetchMissingInProgress}
+                      className="w-full rounded-lg bg-slate-700 px-3 py-2 text-white disabled:cursor-not-allowed disabled:bg-slate-300"
+                    >
+                      {fetchMissingInProgress ? "Requesting..." : "Fetch Missing DM + Group Events"}
+                    </button>
+                    {fetchMissingStatus && (
+                      <div
+                        className={`rounded-lg border p-3 text-sm ${
+                          fetchMissingStatus.kind === "success"
+                            ? "border-green-200 bg-green-50 text-green-700"
+                            : "border-red-200 bg-red-50 text-red-700"
+                        }`}
+                      >
+                        {fetchMissingStatus.message}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <h2 className="text-sm font-semibold">Outbound Messaging</h2>
                 <div className="rounded-lg border border-gray-200 bg-slate-50 p-4 space-y-3">
                   <p className="text-sm text-slate-700">
                     Send a direct self-message using your authenticated Zalo session.
@@ -707,6 +836,7 @@ export default function ZaloAuth() {
                       {sendStatus.message}
                     </div>
                   )}
+                </div>
                 </div>
               </div>
             )}

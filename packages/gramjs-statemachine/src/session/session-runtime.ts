@@ -129,10 +129,6 @@ function pushOutbound(
   }
 }
 
-function toSessionEvent(action: Extract<InternalAction, { type: 'rpc_result' | 'update' }>): SessionEvent {
-  return action;
-}
-
 async function buildReconnectDirective(
   state: SerializedState,
   targetDcId: number,
@@ -181,17 +177,9 @@ async function handleInternalAction(
 ): Promise<{
   nextState: SerializedState;
   outbound?: Uint8Array;
-  event?: SessionEvent;
   transport?: ReconnectDirective;
 }> {
   switch (action.type) {
-    case 'rpc_result':
-    case 'update':
-      return {
-        nextState: state,
-        event: toSessionEvent(action),
-      };
-
     case 'auth_key_ready': {
       const followUp = await continueAuthReady(state);
       return {
@@ -307,7 +295,8 @@ async function handleInternalAction(
 
     default: {
       const _exhaustive: never = action;
-      return { nextState: state, event: _exhaustive as never };
+      void _exhaustive;
+      return { nextState: state };
     }
   }
 }
@@ -413,12 +402,16 @@ async function advanceSession(
       if (handled.outbound) {
         outbound.push(handled.outbound);
       }
-      if (handled.event) {
-        events.push(handled.event);
-      }
       if (handled.transport) {
         transport = handled.transport;
       }
+    }
+
+    if (stepped.decryptedFrame) {
+      events.push({
+        type: 'decrypted_frame',
+        ...stepped.decryptedFrame,
+      });
     }
 
     return {

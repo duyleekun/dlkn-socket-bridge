@@ -26,10 +26,15 @@ import {
   markSocketState,
 } from "../socket-health";
 import { handleSessionEvents } from "./action-handler";
-import { loadMessageRecoveryCursor } from "../runtime-store";
+import {
+  appendSocketActivityBatch,
+  buildRecoveryCommands,
+  resolveMessageRecoveryCursor,
+} from "../runtime-store";
 import {
   executeSessionCommands,
 } from "../bridge-session";
+import { describeRxFrame } from "../socket-activity";
 import type { BridgeSession, Env } from "../types";
 
 async function persistAndExecuteTransition(
@@ -70,22 +75,8 @@ async function requestOfflineBacklogIfNeeded(
     return bridge;
   }
 
-  const cursor = await loadMessageRecoveryCursor(env, sessionKey);
-  const commands = [];
-  if (cursor.lastUserMessageId) {
-    commands.push({
-      type: "request_old_messages" as const,
-      threadType: 0 as const,
-      lastMessageId: cursor.lastUserMessageId,
-    });
-  }
-  if (cursor.lastGroupMessageId) {
-    commands.push({
-      type: "request_old_messages" as const,
-      threadType: 1 as const,
-      lastMessageId: cursor.lastGroupMessageId,
-    });
-  }
+  const cursor = await resolveMessageRecoveryCursor(env, sessionKey);
+  const commands = buildRecoveryCommands(cursor);
 
   const updatedBridge: BridgeSession = {
     ...bridge,
@@ -131,8 +122,10 @@ export async function onCallback(
     type: "inbound_frame",
     frame: rawFrame,
   });
+  const socketActivity = await describeRxFrame(previousState, rawFrame);
 
   try {
+    await appendSocketActivityBatch(env, sessionKey, socketActivity);
     bridge = await persistAndExecuteTransition(
       env,
       workerUrl,

@@ -1,16 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolveTelegramDc } from "gramjs-statemachine";
+import {
+  resolveTelegramDc,
+  transitionSession,
+} from "gramjs-statemachine";
 import { createInitialState } from "../../../packages/gramjs-statemachine/src/types/state.js";
 import { startDhExchange } from "../../../packages/gramjs-statemachine/src/dh/dh-step1-req-pq.js";
-import { advanceSession } from "../../../packages/gramjs-statemachine/src/session/session-runtime.js";
 import { handleSessionEvents } from "../worker/adapter/action-handler";
 import { applyReconnectCommand } from "../worker/bridge-session";
 import { createSessionSnapshotFromLegacy } from "../../../packages/gramjs-statemachine/src/session/session-snapshot.js";
 import {
   loadBridgeSession,
   loadPersistedSession,
+  loadSerializedState,
   loadSessionKeyByCallbackKey,
+  rebuildSessionFromPersisted,
   saveBridgeSession,
 } from "../worker/session-store";
 import type { BridgeSession, Env } from "../worker/types";
@@ -94,14 +98,17 @@ test("advanceSession preserves deterministic ERROR state for negative MTProto fr
     phase: "PQ_SENT" as const,
   };
 
-  const result = await advanceSession(
-    state,
-    new Uint8Array([4, 0, 0, 0, 0x6c, 0xfe, 0xff, 0xff]),
+  const result = await transitionSession(
+    createSessionSnapshotFromLegacy(state),
+    {
+      type: "inbound_frame",
+      frame: new Uint8Array([4, 0, 0, 0, 0x6c, 0xfe, 0xff, 0xff]),
+    },
   );
 
-  assert.equal(result.nextState.phase, "ERROR");
-  assert.equal(result.nextState.error?.message, "MTProto server error: -404 during PQ_SENT");
-  assert.deepEqual(result.outbound, []);
+  assert.equal(result.snapshot.context.protocolPhase, "ERROR");
+  assert.equal(result.snapshot.context.error?.message, "MTProto server error: -404 during PQ_SENT");
+  assert.deepEqual(result.commands, []);
   assert.deepEqual(result.events, []);
 });
 
@@ -222,4 +229,65 @@ test("handleSessionEvents persists QR auth state when the session reaches READY"
   assert.equal(persisted?.authMode, "qr");
   assert.equal(persisted?.phone, "");
   assert.equal(persisted?.user?.id, "1");
+});
+
+test("rebuildSessionFromPersisted creates a fresh runtime session from persisted auth", async () => {
+  const env = fakeEnv();
+  const bridge = buildBridgeSession({ persistedSessionRef: "persisted-1" });
+  await saveBridgeSession(env, bridge.sessionKey, bridge);
+
+  const updatedBridge = await handleSessionEvents(
+    env,
+    bridge.sessionKey,
+    {
+      ...buildReadyState(),
+      value: "authorizing",
+      context: {
+        ...buildReadyState().context,
+        protocolPhase: "QR_IMPORT_SENT",
+      },
+    },
+    buildReadyState(),
+    bridge,
+    [],
+  );
+  const persisted = await loadPersistedSession(env, updatedBridge.persistedSessionRef!);
+  assert.ok(persisted);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    if (url === "http://bridge.test/sockets" && init?.method === "POST") {
+      return new Response(
+        JSON.stringify({
+          socket_id: "socket-restored",
+          send_url: "/sockets/socket-restored",
+          delete_url: "/sockets/socket-restored",
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+    }
+    throw new Error(`unexpected fetch: ${init?.method || "GET"} ${url}`);
+  }) as typeof fetch;
+
+  try {
+    const rebuilt = await rebuildSessionFromPersisted(
+      env,
+      "http://worker.test",
+      persisted!,
+    );
+    assert.notEqual(rebuilt.sessionKey, bridge.sessionKey);
+    assert.equal(rebuilt.bridge.socketId, "socket-restored");
+    assert.equal(rebuilt.bridge.persistedSessionRef, persisted?.persistedSessionRef);
+
+    const savedState = await loadSerializedState(env, rebuilt.sessionKey);
+    const callbackSessionKey = await loadSessionKeyByCallbackKey(env, rebuilt.bridge.callbackKey);
+    assert.equal(savedState?.value, "ready");
+    assert.equal(callbackSessionKey, rebuilt.sessionKey);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

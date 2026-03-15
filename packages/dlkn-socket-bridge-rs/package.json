@@ -2,7 +2,7 @@
   "name": "dlkn-socket-bridge-rs",
   "private": true,
   "scripts": {
-    "dev": "sh -lc 'if ! cargo watch --version >/dev/null 2>&1; then echo \"Installing cargo-watch...\"; cargo install cargo-watch; fi; export BIND_ADDR=127.0.0.1:3000; exec cargo watch --watch src -x run'",
+    "dev": "sh -lc 'if ! cargo watch --version >/dev/null 2>&1; then echo \"Installing cargo-watch...\"; cargo install cargo-watch; fi; export BIND_ADDR=127.0.0.1:3000; exec cargo watch --watch src -s '\\''cargo run || kill -TERM \"$PPID\"'\\'''",
     "build": "cargo build",
     "test": "cargo test"
   }

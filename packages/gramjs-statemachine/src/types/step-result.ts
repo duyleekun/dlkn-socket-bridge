@@ -1,5 +1,6 @@
 import type { SerializedState } from './state.js';
 import type { InternalAction } from './internal-action.js';
+import type { DecryptedFrameDetails } from './session-event.js';
 
 /**
  * The result of a single state machine step.
@@ -15,4 +16,6 @@ export interface StepResult {
   outbound?: Uint8Array;
   /** Internal reducer outputs for the next runtime layer. */
   actions: InternalAction[];
+  /** Worker-facing decrypted frame metadata produced during encrypted steps. */
+  decryptedFrame?: DecryptedFrameDetails;
 }

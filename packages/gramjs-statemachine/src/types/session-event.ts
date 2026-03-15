@@ -1,15 +1,10 @@
-export type SessionEvent =
-  | {
-      type: 'rpc_result';
-      reqMsgId: string;
-      requestName: string;
-      result: unknown;
-      requestId?: string;
-    }
-  | {
-      type: 'update';
-      update: unknown;
-      msgId: string;
-      seqNo: number;
-      envelopeClassName?: string;
-    };
+export interface DecryptedFrameDetails<TObject = unknown> {
+  msgId: string;
+  seqNo: number;
+  object: TObject;
+  requestName?: string;
+}
+
+export interface SessionEvent<TObject = unknown> extends DecryptedFrameDetails<TObject> {
+  type: 'decrypted_frame';
+}

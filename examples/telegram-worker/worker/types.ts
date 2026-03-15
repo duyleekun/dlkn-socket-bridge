@@ -1,10 +1,6 @@
-export interface Env {
-  TG_KV: KVNamespace;
-  ASSETS: Fetcher;
-  TELEGRAM_API_ID: string;
-  TELEGRAM_API_HASH: string;
-  TELEGRAM_SESSION_COOKIE_SECRET: string;
-}
+import type { TelegramUpdatesState } from "gramjs-statemachine";
+
+export type Env = globalThis.Env;
 
 export type TelegramDcMode = "test" | "production";
 export type TelegramAuthMode = "phone" | "qr";
@@ -14,6 +10,10 @@ export type SocketStatus =
   | "stale"
   | "closed"
   | "error";
+export type {
+  TelegramUpdatesState,
+  TelegramUpdatesStateSource,
+} from "gramjs-statemachine";
 
 export interface PersistedTelegramSession {
   version: 1;
@@ -30,17 +30,9 @@ export interface PersistedTelegramSession {
   serverSalt: string;
   timeOffset: number;
   user?: Record<string, unknown>;
+  updatesState?: TelegramUpdatesState;
   createdAt: number;
   updatedAt: number;
-}
-
-export interface PersistedSessionLink {
-  persistedSessionRef: string;
-  liveSessionKey?: string;
-  socketId?: string;
-  bridgeUrl: string;
-  updatedAt: number;
-  socketHealth: SocketStatus;
 }
 
 export interface BridgeSocketHealth {
@@ -66,47 +58,25 @@ export interface BridgeStatusResponse {
   bytes_tx: number;
 }
 
-export type PendingTelegramRequestKind =
-  | "generic"
-  | "dialogs"
-  | "send_message";
-
-export interface PendingTelegramRequest {
-  requestId: string;
-  kind: PendingTelegramRequestKind;
-  method: string;
-  createdAt: number;
-}
+export type ParsedPacketKind =
+  | "rpc_result"
+  | "update"
+  | "service"
+  | "unknown";
 
 export interface ParsedPacketEntry {
   id: string;
   msgId: string;
   seqNo: number;
   receivedAt: number;
-  requiresAck: boolean;
-  className: string;
-  envelopeClassName?: string;
+  kind: ParsedPacketKind;
+  topLevelClassName?: string;
   reqMsgId?: string;
+  requestName?: string;
+  resultClassName?: string;
+  error?: string;
+  summary: string;
   payload: unknown;
-}
-
-export type ConversationPeerType = "user" | "chat" | "channel";
-
-export interface ConversationOption {
-  id: string;
-  peerType: ConversationPeerType;
-  peerId: string;
-  accessHash?: string;
-  title: string;
-  subtitle?: string;
-  unreadCount?: number;
-  topMessage?: number;
-}
-
-export interface ConversationCache {
-  items: ConversationOption[];
-  updatedAt: number;
-  totalCount?: number;
 }
 
 /**
@@ -120,6 +90,7 @@ export interface BridgeSession {
   socketId: string;
   bridgeUrl: string;
   persistedSessionRef?: string;
+  updatesState?: TelegramUpdatesState;
   socketStatus: SocketStatus;
   socketLastCheckedAt?: number;
   socketLastHealthyAt?: number;

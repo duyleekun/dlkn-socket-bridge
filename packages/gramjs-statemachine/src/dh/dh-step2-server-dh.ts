@@ -9,7 +9,6 @@ import { Factorizator } from 'telegram/crypto/Factorizator.js';
 import { _serverKeys } from 'telegram/crypto/RSA.js';
 import { generateRandomBytes, readBufferFromBigInt } from 'telegram/Helpers.js';
 import { Api } from 'telegram/tl/index.js';
-import { BinaryReader } from 'telegram/extensions/index.js';
 
 import type { SerializedState } from '../types/state.js';
 import type { StepResult } from '../types/step-result.js';
@@ -24,6 +23,7 @@ import {
   bigIntToBytesBE,
   fingerprintToHex,
 } from '../session/bigint-helpers.js';
+import { readTlObject } from '../tl/read-object.js';
 
 export async function handleResPq(
   state: SerializedState,
@@ -36,10 +36,7 @@ export async function handleResPq(
   const { body } = unwrapPlainMessage(stripped);
 
   // 3. Deserialize ResPQ
-  const reader = new BinaryReader(Buffer.from(body));
-  const resPq = await Promise.resolve(
-    reader.tgReadObject(),
-  ) as InstanceType<typeof Api.ResPQ>;
+  const resPq = await readTlObject(body) as InstanceType<typeof Api.ResPQ>;
   console.debug('[gramjs-statemachine] handleResPq', {
     phase: state.phase,
     inboundFrameLength: inbound.length,
@@ -51,12 +48,12 @@ export async function handleResPq(
   return buildReqDhParams(state, resPq, newNonceBytes);
 }
 
-export function buildReqDhParams(
+export async function buildReqDhParams(
   state: SerializedState,
   resPq: InstanceType<typeof Api.ResPQ>,
   newNonceBytes: Uint8Array,
   randomBytes?: (size: number) => Uint8Array,
-): StepResult {
+): Promise<StepResult> {
   // 4. Extract server nonce as LE bytes
   const serverNonce = bigIntToBytesLE(resPq.serverNonce, 16);
 
@@ -110,7 +107,7 @@ export function buildReqDhParams(
   // step remains explicit and independently testable inside the state machine.
   // Characterization tests show the resulting ReqDHParams body matches stock
   // GramJS Authenticator under fixed entropy.
-  const encryptedData = rsaEncryptMtproto2(innerDataBytes, matchedFpHex, randomBytes);
+  const encryptedData = await rsaEncryptMtproto2(innerDataBytes, matchedFpHex, randomBytes);
 
   // 11. Build ReqDHParams
   const reqDH = new Api.ReqDHParams({

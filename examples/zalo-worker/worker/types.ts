@@ -1,3 +1,5 @@
+import type { ExtractedSocketMessage } from "zca-js-statemachine";
+
 export interface Env {
   ZALO_KV: KVNamespace;
   ASSETS: Fetcher;
@@ -66,15 +68,36 @@ export interface BridgeStatusResponse {
   bytes_tx: number;
 }
 
-export interface ZaloMessage {
+export type ZaloMessage = ExtractedSocketMessage;
+
+export interface SocketActivityEntry {
   id: string;
-  threadId: string;
-  threadType: number;
+  direction: "rx" | "tx";
+  timestamp: number;
+  type: string;
+  summary: string;
+  details?: string;
+  cmd?: number;
+  subCmd?: number;
+  payloadKind?: "decrypted" | "wrapper" | "raw";
+  bytes: number;
+  recovered?: boolean;
+}
+
+export function readZaloMessage(message: ZaloMessage): {
+  id: string;
   fromId: string;
   content: string;
   timestamp: number;
-  msgType?: string;
-  recovered?: boolean;
+  msgType: string;
+} {
+  return {
+    id: message.id,
+    fromId: message.fromId,
+    content: message.content,
+    timestamp: message.timestamp,
+    msgType: message.msgType,
+  };
 }
 
 export interface ZaloMessageRecoveryCursor {

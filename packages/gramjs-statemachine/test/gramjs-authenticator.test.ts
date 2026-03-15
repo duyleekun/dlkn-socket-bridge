@@ -7,11 +7,12 @@ import { BinaryReader } from 'telegram/extensions/index.js';
 import { Api } from 'telegram/tl/index.js';
 import { doAuthentication } from 'telegram/network/Authenticator.js';
 import { Factorizator } from 'telegram/crypto/Factorizator.js';
-import { getByteArray, generateKeyDataFromNonce, sha1 } from 'telegram/Helpers.js';
+import { _serverKeys, encryptMtproto2 as gramjsEncryptMtproto2 } from 'telegram/crypto/RSA.js';
+import { getByteArray, generateKeyDataFromNonce, sha1, sha256, bufferXor, readBigIntFromBuffer, readBufferFromBigInt } from 'telegram/Helpers.js';
 import { buildReqDhParams } from '../src/dh/dh-step2-server-dh.js';
 import { buildSetClientDhParams } from '../src/dh/dh-step3-client-dh.js';
 import { createInitialState } from '../src/types/state.js';
-import { aesIgeDecrypt, aesIgeEncrypt } from '../src/session/crypto.js';
+import { aesIgeDecrypt, aesIgeEncrypt, aesIgeEncrypt as legacyAesIgeEncrypt } from '../src/session/crypto.js';
 import { bigIntFromBytesBE, bigIntFromBytesLE } from '../src/session/bigint-helpers.js';
 import type { SerializedState } from '../src/types/state.js';
 import {
@@ -185,7 +186,7 @@ describe('GramJS Authenticator characterization', () => {
       lastMsgId: '7301444403200000000',
     };
 
-    const oursReqDhResult = buildReqDhParams(
+    const oursReqDhResult = await buildReqDhParams(
       initialState,
       resPqTemplate,
       newNonceBytes,
@@ -252,4 +253,89 @@ describe('GramJS Authenticator characterization', () => {
     assert.equal(authInner.retryId.toString(), oursInner.retryId.toString());
     assert.equal(oursSetDhResult.nextState.timeOffset, 123);
   });
+
+  it('patched encryptMtproto2 matches the legacy byte output under fixed entropy', async () => {
+    const resPqTemplate = parseFixedResPq();
+    const randomSource = Uint8Array.from(
+      Array.from({ length: 512 }, (_, index) => (index * 13 + 7) & 0xff),
+    );
+    const nonceBytes = randomSource.slice(0, 16);
+    const newNonceBytes = randomSource.slice(16, 48);
+    const pqInt = bigIntFromBytesBE(new Uint8Array(resPqTemplate.pq as Buffer));
+    const { p, q } = Factorizator.factorize(pqInt);
+    const inner = new Api.PQInnerData({
+      pq: resPqTemplate.pq,
+      p: getByteArray(p),
+      q: getByteArray(q),
+      nonce: bigIntFromBytesBE(nonceBytes),
+      serverNonce: resPqTemplate.serverNonce,
+      newNonce: bigIntFromBytesLE(newNonceBytes),
+    });
+    const innerBytes = new Uint8Array(inner.getBytes());
+    const fingerprintHex = resPqTemplate.serverPublicKeyFingerprints
+      .map((fingerprint) => {
+        const two64 = bigInt("10000000000000000", 16);
+        const unsigned = fingerprint.isNegative() ? fingerprint.add(two64) : fingerprint;
+        return unsigned.toString(16).padStart(16, "0");
+      })[0]!;
+    const legacyRandom = makeRandomStream(randomSource, 48);
+    const currentRandom = makeRandomStream(randomSource, 48);
+    const legacy = await legacyEncryptMtproto2(innerBytes, fingerprintHex, legacyRandom);
+    const current = await gramjsEncryptMtproto2(
+      Buffer.from(innerBytes),
+      fingerprintHex,
+      (size) => Buffer.from(currentRandom(size)),
+    );
+
+    assert.equal(Buffer.from(current).toString("hex"), Buffer.from(legacy).toString("hex"));
+  });
 });
+
+async function legacyEncryptMtproto2(
+  data: Uint8Array,
+  fingerprintHex: string,
+  randomBytes: (size: number) => Uint8Array,
+): Promise<Uint8Array> {
+  const key = Array.from(_serverKeys.entries())
+    .map(([fingerprint, value]) => {
+      const signed = bigInt(fingerprint);
+      const two64 = bigInt("10000000000000000", 16);
+      const unsigned = signed.isNegative() ? signed.add(two64) : signed;
+      return [unsigned.toString(16).padStart(16, "0"), value] as const;
+    })
+    .find(([hex]) => hex === fingerprintHex)?.[1];
+
+  if (!key) {
+    throw new Error(`missing RSA key ${fingerprintHex}`);
+  }
+
+  const dataWithPadding = Buffer.concat([
+    Buffer.from(data),
+    Buffer.from(randomBytes(192 - data.length)),
+  ]);
+  const dataPadReversed = Buffer.from(dataWithPadding).reverse();
+
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const tempKey = Buffer.from(randomBytes(32));
+    const shaDigest = await sha256(Buffer.concat([tempKey, dataWithPadding]));
+    const aesEncrypted = legacyAesIgeEncrypt(
+      new Uint8Array(Buffer.concat([dataPadReversed, shaDigest])),
+      new Uint8Array(tempKey),
+      new Uint8Array(32),
+    );
+    const tempKeyXor = bufferXor(
+      Buffer.from(tempKey),
+      await sha256(Buffer.from(aesEncrypted)),
+    );
+    const keyAesEncrypted = Buffer.concat([tempKeyXor, Buffer.from(aesEncrypted)]);
+    const keyAesInt = readBigIntFromBuffer(keyAesEncrypted, false, false);
+    if (keyAesInt.greaterOrEquals(bigInt(key.n))) {
+      continue;
+    }
+    return new Uint8Array(
+      readBufferFromBigInt(keyAesInt.modPow(bigInt(key.e), bigInt(key.n)), 256, false),
+    );
+  }
+
+  throw new Error("legacyEncryptMtproto2 failed to find valid padding");
+}

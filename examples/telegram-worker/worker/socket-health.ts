@@ -7,7 +7,6 @@ import { resolveBridgeUrl } from "./bridge-url";
 import {
   loadBridgeSession,
   saveBridgeSession,
-  updatePersistedLinkFromBridge,
 } from "./session-store";
 import type {
   BridgeSession,
@@ -79,7 +78,6 @@ export async function markSocketState(
       socketStatus === "healthy" ? now : bridge.socketLastHealthyAt,
   };
   await saveBridgeSession(env, sessionKey, updatedBridge);
-  await updatePersistedLinkFromBridge(env, sessionKey, updatedBridge, socketStatus);
   return updatedBridge;
 }
 
@@ -111,7 +109,6 @@ export async function probeBridgeSocket(
       socketLastHealthyAt: now,
     };
     await saveBridgeSession(env, sessionKey, updatedBridge);
-    await updatePersistedLinkFromBridge(env, sessionKey, updatedBridge, "healthy");
     return {
       status: "healthy",
       socketId: currentBridge.socketId,

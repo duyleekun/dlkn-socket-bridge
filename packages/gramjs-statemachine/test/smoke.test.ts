@@ -15,7 +15,16 @@ import { sendApiMethod } from '../src/api/invoke.js';
 import { sendCode, signIn, exportQrToken } from '../src/auth/login-steps.js';
 import { resolveTelegramDc, parseMigrateDc } from '../src/dc/dc-resolver.js';
 import { startDhExchange } from '../src/dh/dh-step1-req-pq.js';
-import { normalizeTlValue } from '../src/dispatch/inbound-dispatch.js';
+import {
+  classifyDecryptedFrame,
+  normalizeTlValue,
+  parseRpcResultFrame,
+} from '../src/dispatch/inbound-dispatch.js';
+import {
+  buildTelegramGetDifferenceParams,
+  extractTelegramUpdatesState,
+} from '../src/dispatch/updates-state.js';
+import type { SessionEvent } from '../src/types/session-event.js';
 import { step } from '../src/step.js';
 import { buildReqPqMultiFrame } from '../src/dh/dh-step1-req-pq.js';
 import { buildReqDhParams } from '../src/dh/dh-step2-server-dh.js';
@@ -148,7 +157,7 @@ describe('startDhExchange', () => {
 });
 
 describe('handleResPq', () => {
-  it('matches the legacy req_DH_params envelope for fixed inputs', () => {
+  it('matches the legacy req_DH_params envelope for fixed inputs', async () => {
     const state: SerializedState = {
       ...createInitialState({
         apiId: '12345',
@@ -164,7 +173,7 @@ describe('handleResPq', () => {
     };
     const resPq = parseFixedResPq();
 
-    withFixedNow(() => {
+    await withFixedNow(async () => {
       const randomBytes = makeRandomStream(
         fromHex(
           '0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20' +
@@ -177,7 +186,7 @@ describe('handleResPq', () => {
         0,
       );
 
-      const result = buildReqDhParams(
+      const result = await buildReqDhParams(
         state,
         resPq,
         fromHex('364c948ec6a29b95e638c8f25287dac5250cc1ecd767c3f004543dbdceae53a3'),
@@ -551,6 +560,125 @@ describe('parseMigrateDc', () => {
 });
 
 // ── normalizeTlValue ──────────────────────────────────────────────────────────
+
+describe('decrypted frame helpers', () => {
+  it('classifies and parses RPC results for worker-side consumers', async () => {
+    const object = {
+      className: 'RPCResult',
+      reqMsgId: 12345n,
+      body: new Api.messages.Dialogs({
+        dialogs: [],
+        messages: [],
+        chats: [],
+        users: [],
+      }),
+    };
+
+    assert.equal(classifyDecryptedFrame(object), 'rpc_result');
+
+    const parsed = await parseRpcResultFrame(object, {
+      requestName: 'messages.GetDialogs',
+    });
+    assert.equal(parsed?.reqMsgId, '12345');
+    assert.equal(parsed?.requestName, 'messages.GetDialogs');
+    assert.equal(parsed?.resultClassName, 'messages.Dialogs');
+    assert.deepEqual(parsed?.normalizedResult, {
+      className: 'messages.Dialogs',
+      dialogs: [],
+      messages: [],
+      chats: [],
+      users: [],
+    });
+  });
+
+  it('extracts updates state from updates.GetState results', async () => {
+    const event: SessionEvent = {
+      type: 'decrypted_frame',
+      object: {
+        className: 'RPCResult',
+        reqMsgId: 12345n,
+        body: new Api.updates.State({
+          pts: 101,
+          qts: 202,
+          date: 303,
+          seq: 404,
+          unreadCount: 0,
+        }),
+      },
+      msgId: '777',
+      seqNo: 5,
+      requestName: 'updates.GetState',
+    };
+
+    assert.deepEqual(
+      await extractTelegramUpdatesState(event, null, { updatedAt: 999 }),
+      {
+        pts: 101,
+        qts: 202,
+        date: 303,
+        seq: 404,
+        updatedAt: 999,
+        source: 'getState',
+      },
+    );
+  });
+
+  it('extracts catch-up state from updates.GetDifference results', async () => {
+    const event: SessionEvent = {
+      type: 'decrypted_frame',
+      object: {
+        className: 'RPCResult',
+        reqMsgId: 12346n,
+        body: new Api.updates.Difference({
+          newMessages: [],
+          newEncryptedMessages: [],
+          otherUpdates: [],
+          chats: [],
+          users: [],
+          state: new Api.updates.State({
+            pts: 111,
+            qts: 222,
+            date: 333,
+            seq: 444,
+            unreadCount: 0,
+          }),
+        }),
+      },
+      msgId: '778',
+      seqNo: 6,
+      requestName: 'updates.GetDifference',
+    };
+
+    assert.deepEqual(
+      await extractTelegramUpdatesState(event, null, { updatedAt: 1000 }),
+      {
+        pts: 111,
+        qts: 222,
+        date: 333,
+        seq: 444,
+        updatedAt: 1000,
+        source: 'getDifference',
+      },
+    );
+  });
+
+  it('builds getDifference params from stored updates state', () => {
+    assert.deepEqual(
+      buildTelegramGetDifferenceParams({
+        pts: 10,
+        qts: 20,
+        date: 30,
+        seq: 40,
+        updatedAt: 50,
+      }),
+      {
+        pts: 10,
+        qts: 20,
+        date: 30,
+      },
+    );
+  });
+});
 
 describe('normalizeTlValue', () => {
   it('passes through primitives', () => {

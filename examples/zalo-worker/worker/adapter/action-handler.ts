@@ -5,8 +5,9 @@
  * This module only performs worker-specific persistence (message log, etc.).
  */
 import type { ZaloSessionEvent } from "zca-js-statemachine";
+import { extractSocketMessages } from "zca-js-statemachine";
 import { appendMessage } from "../runtime-store";
-import type { Env, ZaloMessage } from "../types";
+import type { Env } from "../types";
 
 export async function handleSessionEvents(
   env: Env,
@@ -15,21 +16,6 @@ export async function handleSessionEvents(
 ): Promise<void> {
   for (const event of events) {
     switch (event.type) {
-      case "message": {
-        const msg: ZaloMessage = {
-          id: event.message.id,
-          threadId: event.message.threadId,
-          threadType: event.message.threadType,
-          fromId: event.message.fromId,
-          content: event.message.content,
-          timestamp: event.message.timestamp,
-          msgType: event.message.msgType,
-          recovered: event.message.recovered,
-        };
-        await appendMessage(env, sessionKey, msg);
-        break;
-      }
-
       case "login_success":
         console.log(`[action-handler] login success for session ${sessionKey}`, {
           uid: event.userProfile.uid,
@@ -49,16 +35,15 @@ export async function handleSessionEvents(
         });
         break;
 
-      case "group_event":
-        console.log(`[action-handler] group event for session ${sessionKey}`);
-        break;
-
-      case "reaction":
-        console.log(`[action-handler] reaction for session ${sessionKey}`);
-        break;
-
-      case "update":
-        console.log(`[action-handler] update for session ${sessionKey}`);
+      case "frame":
+        for (const message of extractSocketMessages(event)) {
+          await appendMessage(env, sessionKey, message);
+        }
+        console.log(`[action-handler] frame for session ${sessionKey}`, {
+          cmd: event.cmd,
+          subCmd: event.subCmd,
+          payloadKind: event.payloadKind,
+        });
         break;
 
       default: {

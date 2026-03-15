@@ -1,0 +1,58 @@
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index b69610b1841b3f1e7b61d643aa6c19b456f97a01..19da279fa6a478550af7805ab548e95de347d836 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -1,6 +1,7 @@
+ export * from "./Errors/index.js";
+ export * from "./models/index.js";
+ export * from "./zalo.js";
++export { decodeEventData, getFriendEventType, getGroupEventType, hasOwn } from "./utils.js";
+ export type { ContextSession, ContextBase, AppContextExtended, AppContextBase, Options, ZPWServiceMap, ImageMetadataGetter, ImageMetadataGetterResponse } from "./context.js";
+ export type { AcceptFriendRequestResponse } from "./apis/acceptFriendRequest.js";
+ export type { AddGroupBlockedMemberResponse } from "./apis/addGroupBlockedMember.js";
+diff --git a/dist/index.js b/dist/index.js
+index 3b9b8bd889671f8d63aae3a1fe686106714969d3..b94da09d516224023bbb87950aa8285fcd9176d6 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -1,6 +1,7 @@
+ export * from "./Errors/index.js";
+ export * from "./models/index.js";
+ export * from "./zalo.js";
++export { decodeEventData, getFriendEventType, getGroupEventType, hasOwn } from "./utils.js";
+ // Others (Enum)
+ export { CloseReason } from "./apis/listen.js";
+ export { LoginQRCallbackEventType } from "./apis/loginQR.js";
+diff --git a/dist/models/Message.d.ts b/dist/models/Message.d.ts
+index 5686406d35b1b5739bf31c12b00314f801724b46..f1a7262210eae88bd6db822c7cca3274796e2ca6 100644
+--- a/dist/models/Message.d.ts
++++ b/dist/models/Message.d.ts
+@@ -16,6 +16,7 @@ export type TMessage = {
+     actionId: string;
+     msgId: string;
+     cliMsgId: string;
++    globalMsgId?: string | number;
+     msgType: string;
+     uidFrom: string;
+     idTo: string;
+@@ -46,6 +47,7 @@ export type TMessage = {
+     st: number;
+     at: number;
+     realMsgId: string;
++    attach?: unknown[];
+     quote: TQuote | undefined;
+ };
+ export type TGroupMessage = TMessage & {
+diff --git a/package.json b/package.json
+index 363d4121dfcd98909eea9a6b61781016f3beb231..b95284e96e90926f80679e934e684f5cb2418d84 100644
+--- a/package.json
++++ b/package.json
+@@ -6,8 +6,7 @@
+     "type": "module",
+     "exports": {
+         ".": {
+-            "require": "./dist/cjs/index.cjs",
+-            "types": "./index.d.ts",
++            "types": "./dist/index.d.ts",
+             "default": "./dist/index.js"
+         }
+     },

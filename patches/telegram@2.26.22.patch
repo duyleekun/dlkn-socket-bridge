@@ -1,0 +1,78 @@
+diff --git a/crypto/RSA.d.ts b/crypto/RSA.d.ts
+index d148a8aaf4f2e129407b0d4215a4fc72ab20566c..ab752f2624cda304780be478a9e941b1c3487b74 100644
+--- a/crypto/RSA.d.ts
++++ b/crypto/RSA.d.ts
+@@ -12,3 +12,4 @@ export declare const _serverKeys: Map<string, {
+  * @returns {Buffer|*|undefined} the cipher text, or undefined if no key matching this fingerprint is found.
+  */
+ export declare function encrypt(fingerprint: bigInt.BigInteger, data: Buffer): Promise<Buffer | undefined>;
++export declare function encryptMtproto2(data: Buffer, fingerprintHex: string, randomBytes?: (count: number) => Buffer | Uint8Array): Promise<Buffer>;
+diff --git a/crypto/RSA.js b/crypto/RSA.js
+index 4ab93bf873787f0169cec1816998606766a49048..296638222cdd3bd2d71bae83c9b5d9413e0f42eb 100644
+--- a/crypto/RSA.js
++++ b/crypto/RSA.js
+@@ -15,9 +15,11 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
+ };
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports._serverKeys = void 0;
++exports.encryptMtproto2 = encryptMtproto2;
+ exports.encrypt = encrypt;
+ const big_integer_1 = __importDefault(require("big-integer"));
+ const Helpers_1 = require("../Helpers");
++const IGE_1 = require("./IGE");
+ const PUBLIC_KEYS = [
+     {
+         fingerprint: (0, big_integer_1.default)("-3414540481677951611"),
+@@ -45,6 +47,20 @@ PUBLIC_KEYS.forEach((_a) => {
+     var { fingerprint } = _a, keyInfo = __rest(_a, ["fingerprint"]);
+     exports._serverKeys.set(fingerprint.toString(), keyInfo);
+ });
++function getMtproto2ServerKey(fingerprintHex) {
++    for (const [fingerprint, key] of exports._serverKeys.entries()) {
++        const signed = (0, big_integer_1.default)(fingerprint);
++        const two64 = (0, big_integer_1.default)("10000000000000000", 16);
++        const unsigned = signed.isNegative() ? signed.add(two64) : signed;
++        if (unsigned.toString(16).padStart(16, "0") === fingerprintHex) {
++            return {
++                n: (0, big_integer_1.default)(key.n),
++                e: (0, big_integer_1.default)(key.e),
++            };
++        }
++    }
++    return undefined;
++}
+ /**
+  * Encrypts the given data known the fingerprint to be used
+  * in the way Telegram requires us to do so (sha1(data) + data + padding)
+@@ -68,3 +84,31 @@ async function encrypt(fingerprint, data) {
+     // rsa module uses transform.int2bytes(encrypted, keylength), easier:
+     return (0, Helpers_1.readBufferFromBigInt)(encrypted, 256, false);
+ }
++/**
++ * Encrypts the given data using Telegram's MTProto 2.0 RSA padding scheme.
++ * `fingerprintHex` must be the unsigned lower-case hex fingerprint.
++ */
++async function encryptMtproto2(data, fingerprintHex, randomBytes = Helpers_1.generateRandomBytes) {
++    const key = getMtproto2ServerKey(fingerprintHex);
++    if (!key) {
++        throw new Error(`unknown RSA key fingerprint: ${fingerprintHex}`);
++    }
++    if (data.length > 144) {
++        throw new Error(`encryptMtproto2: data too long (${data.length} > 144)`);
++    }
++    const dataWithPadding = Buffer.concat([Buffer.from(data), Buffer.from(randomBytes(192 - data.length))]);
++    const dataPadReversed = Buffer.from(dataWithPadding).reverse();
++    for (let attempt = 0; attempt < 20; attempt += 1) {
++        const tempKey = Buffer.from(randomBytes(32));
++        const shaDigest = await (0, Helpers_1.sha256)(Buffer.concat([tempKey, dataWithPadding]));
++        const aesEncrypted = new IGE_1.IGE(tempKey, Buffer.alloc(32)).encryptIge(Buffer.concat([dataPadReversed, shaDigest]));
++        const tempKeyXor = (0, Helpers_1.bufferXor)(Buffer.from(tempKey), await (0, Helpers_1.sha256)(aesEncrypted));
++        const keyAesEncrypted = Buffer.concat([tempKeyXor, Buffer.from(aesEncrypted)]);
++        const keyAesInt = (0, Helpers_1.readBigIntFromBuffer)(keyAesEncrypted, false, false);
++        if (keyAesInt.greaterOrEquals(key.n)) {
++            continue;
++        }
++        return (0, Helpers_1.readBufferFromBigInt)(keyAesInt.modPow(key.e, key.n), 256, false);
++    }
++    throw new Error("encryptMtproto2: failed to find valid padding after 20 retries");
++}

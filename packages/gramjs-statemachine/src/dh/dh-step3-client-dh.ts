@@ -15,7 +15,6 @@ import {
   sha1,
 } from 'telegram/Helpers.js';
 import { Api } from 'telegram/tl/index.js';
-import { BinaryReader } from 'telegram/extensions/index.js';
 
 import type { SerializedState } from '../types/state.js';
 import type { StepResult } from '../types/step-result.js';
@@ -27,6 +26,7 @@ import {
   bigIntFromBytesBE,
   bigIntFromBytesLE,
 } from '../session/bigint-helpers.js';
+import { readTlObject } from '../tl/read-object.js';
 
 function bigIntFromBytesUnsignedBE(bytes: Uint8Array) {
   return readBigIntFromBuffer(Buffer.from(bytes), false, false);
@@ -62,9 +62,8 @@ export async function handleServerDHParams(
   // 1. Strip transport frame + unwrap plain message + deserialize
   const stripped = stripTransportFrame(inbound);
   const { body } = unwrapPlainMessage(stripped);
-  const reader = new BinaryReader(Buffer.from(body));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const dhParams = await Promise.resolve(reader.tgReadObject()) as any;
+  const dhParams = await readTlObject(body) as any;
   console.debug('[gramjs-statemachine] handleServerDHParams', {
     phase: state.phase,
     inboundFrameLength: inbound.length,
@@ -113,9 +112,8 @@ export async function buildSetClientDhParams(
   );
 
   // 5. Skip first 20 bytes (sha1 hash), deserialize ServerDHInnerData
-  const innerReader = new BinaryReader(Buffer.from(decrypted.slice(20)));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const innerData = await Promise.resolve(innerReader.tgReadObject()) as any;
+  const innerData = await readTlObject(decrypted.slice(20)) as any;
 
   // 6. Extract DH parameters
   const g: number = innerData.g;

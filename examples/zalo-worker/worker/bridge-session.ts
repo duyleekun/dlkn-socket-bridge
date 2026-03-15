@@ -23,6 +23,8 @@ import {
   isSocketGoneError,
   markSocketState,
 } from "./socket-health";
+import { appendSocketActivity } from "./runtime-store";
+import { describeTxFrame } from "./socket-activity";
 import type { BridgeSession, Env, PersistedZaloSession } from "./types";
 
 export async function sendBridgeBytes(
@@ -34,6 +36,11 @@ export async function sendBridgeBytes(
   const bridgeUrl = resolveBridgeUrl(bridge.bridgeUrl);
   try {
     await sendBytes(bridgeUrl, bridge.socketId, bytes);
+    await appendSocketActivity(
+      env,
+      sessionKey,
+      describeTxFrame(bytes),
+    );
   } catch (error) {
     if (isSocketGoneError(error)) {
       await cleanupSocket(bridgeUrl, bridge.socketId);
@@ -113,10 +120,6 @@ export async function executeSessionCommands(
 
   for (const command of commands) {
     switch (command.type) {
-      case "send_frame":
-        await sendBridgeBytes(env, sessionKey, currentBridge, command.frame);
-        break;
-
       case "send_ping": {
         const pingFrame = buildPingFrame();
         await sendBridgeBytes(env, sessionKey, currentBridge, pingFrame);
@@ -140,9 +143,6 @@ export async function executeSessionCommands(
           currentBridge,
           command,
         );
-        if (command.firstFrame) {
-          await sendBridgeBytes(env, sessionKey, currentBridge, command.firstFrame);
-        }
         break;
 
       case "persist_credentials": {

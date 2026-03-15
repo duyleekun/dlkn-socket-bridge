@@ -1,10 +1,9 @@
+import { parseSocketFrame } from '../framing/socket.js';
 import { createInitialState } from '../types/state.js';
 import type { ZaloSerializedState } from '../types/state.js';
 import type { ZaloSessionCommand } from '../types/session-command.js';
 import type { ZaloSessionEvent } from '../types/session-event.js';
 import type { ZaloSessionTransitionResult } from '../types/session-result.js';
-import { dispatchInboundFrame } from '../dispatch/inbound-dispatch.js';
-import { buildPingFrame } from '../framing/zalo-frame-codec.js';
 import { buildZaloWsHeaders } from '../ws-url/ws-url.js';
 import {
   createSnapshotFromState,
@@ -62,43 +61,53 @@ async function applyHostEvent(
 
   switch (event.type) {
     case 'inbound_frame': {
-      const result = await dispatchInboundFrame(ctx, event.frame);
-      // If we received cipher key (state stays the same value but context updated)
-      // If we were ws_connecting and received cipher key → transition to listening
+      const parsedEvents = await parseSocketFrame(event.frame, {
+        cipherKey: ctx.cipherKey ?? undefined,
+      });
       let nextValue = snapshot.value;
-      const commands = [...result.commands];
-      if (result.nextContext.cipherKey && !ctx.cipherKey) {
-        if (snapshot.value === 'ws_connecting' || snapshot.value === 'reconnecting') {
-          nextValue = 'listening';
-          commands.push({ type: 'send_ping' });
-        }
-      }
-      return {
-        snapshot: createSnapshotFromState(nextValue, result.nextContext),
-        commands,
-        events: result.events,
-      };
-    }
+      let nextContext = ctx;
+      const commands: ZaloSessionCommand[] = [];
+      const events: ZaloSessionEvent[] = [];
+      let shouldSendPing = false;
 
-    case 'ws_connected': {
-      // Transition from qr_connecting → qr_awaiting_scan (waiting for cipher key + QR)
-      // or from ws_connecting/reconnecting → ws_connecting (waiting for cipher key)
-      let nextValue: ZaloStateMachineValue = snapshot.value;
-      if (snapshot.value === 'qr_connecting') {
-        nextValue = 'qr_awaiting_scan';
-      } else if (snapshot.value === 'ws_connecting' || snapshot.value === 'reconnecting') {
-        nextValue = 'ws_connecting'; // stays, waiting for cipher key frame
+      for (const parsedEvent of parsedEvents) {
+        if (parsedEvent.type === 'cipher_key') {
+          nextContext = { ...nextContext, cipherKey: parsedEvent.key };
+          if (snapshot.value === 'ws_connecting' || snapshot.value === 'reconnecting') {
+            shouldSendPing = true;
+          }
+          continue;
+        }
+
+        if (parsedEvent.type === 'duplicate_connection') {
+          nextValue = 'error';
+          nextContext = {
+            ...nextContext,
+            phase: 'error',
+            errorMessage: 'Duplicate Zalo connection detected.',
+          };
+          continue;
+        }
+
+        events.push(parsedEvent);
       }
-      const nextCtx: ZaloSerializedState = {
-        ...ctx,
-        phase: nextValue as ZaloSerializedState['phase'],
-        lastConnectedAt: Date.now(),
-        cipherKey: null, // reset cipher key on new connection
-      };
+
+      if (shouldSendPing && nextValue !== 'error') {
+        nextValue = 'listening';
+        commands.push({ type: 'send_ping' });
+      }
+
+      if (nextValue !== snapshot.value) {
+        nextContext = {
+          ...nextContext,
+          phase: nextValue as ZaloSerializedState['phase'],
+        };
+      }
+
       return {
-        snapshot: createSnapshotFromState(nextValue, nextCtx),
-        commands: [{ type: 'send_ping' }],
-        events: [],
+        snapshot: createSnapshotFromState(nextValue, nextContext),
+        commands,
+        events,
       };
     }
 
@@ -128,8 +137,8 @@ async function applyHostEvent(
           type: 'reconnect',
           wsUrl: ctx.wsUrl,
           headers: buildZaloWsHeaders(ctx.credentials, ctx.wsUrl),
-          firstFrame: buildPingFrame(),
         });
+        commands.push({ type: 'send_ping' });
       }
       return {
         snapshot: createSnapshotFromState(nextValue, nextCtx),
@@ -195,8 +204,8 @@ async function applyHostEvent(
             type: 'reconnect',
             wsUrl,
             headers: buildZaloWsHeaders(credentials, wsUrl),
-            firstFrame: buildPingFrame(),
           },
+          { type: 'send_ping' },
         ],
         events: [{ type: 'login_success', credentials, userProfile }],
       };

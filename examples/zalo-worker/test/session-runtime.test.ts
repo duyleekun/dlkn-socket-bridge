@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import {
   createInitialState,
   createSnapshotFromState,
+  encodeWsFrame,
   transitionSession,
 } from "zca-js-statemachine";
-import { encodeFrame } from "../../../packages/zca-js-statemachine/src/framing/zalo-frame-codec.js";
 
 function fakeCredentials() {
   return {
@@ -47,19 +47,13 @@ test("first cipher-key frame promotes ws_connecting to listening", async () => {
   assert.equal(loggedIn.snapshot.value, "ws_connecting");
   const reconnectCommand = loggedIn.commands.find((command) => command.type === "reconnect");
   assert.ok(reconnectCommand);
-  assert.ok(reconnectCommand.firstFrame);
+  assert.ok(loggedIn.commands.some((command) => command.type === "send_ping"));
 
-  const connected = await transitionSession(loggedIn.snapshot, {
-    type: "ws_connected",
-  });
-
-  assert.equal(connected.snapshot.value, "ws_connecting");
-
-  const handshakeFrame = encodeFrame(1, 1, 1, {
+  const handshakeFrame = encodeWsFrame(1, 1, 1, {
     key: "base64-cipher-key",
   });
 
-  const listening = await transitionSession(connected.snapshot, {
+  const listening = await transitionSession(loggedIn.snapshot, {
     type: "inbound_frame",
     frame: handshakeFrame,
   });

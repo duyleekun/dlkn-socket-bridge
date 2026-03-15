@@ -1,46 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import bigInt from "big-integer";
-import { Api } from "../worker/mtproto/serializer";
+import {
+  Api,
+  classifyDecryptedFrame,
+  parseRpcResultFrame,
+} from "gramjs-statemachine";
 import {
   buildConversationCacheFromDialogs,
   buildInputPeerFromConversation,
-} from "../worker/mtproto/inbound";
-import {
-  loadPendingRequests,
-  resolvePendingRequest,
-  trackPendingRequest,
-} from "../worker/runtime-store";
-import type { Env } from "../worker/types";
-
-class MemoryKV {
-  private store = new Map<string, string>();
-
-  async get<T>(key: string, type?: "json"): Promise<T | string | null> {
-    const value = this.store.get(key);
-    if (value === undefined) {
-      return null;
-    }
-    if (type === "json") {
-      return JSON.parse(value) as T;
-    }
-    return value;
-  }
-
-  async put(key: string, value: string): Promise<void> {
-    this.store.set(key, value);
-  }
-
-  async delete(key: string): Promise<void> {
-    this.store.delete(key);
-  }
-}
-
-function fakeEnv(): Env {
-  return {
-    TG_KV: new MemoryKV() as unknown as KVNamespace,
-  } as Env;
-}
+} from "../worker/inbound";
 
 test("dialogs responses populate a conversation cache and rebuild input peers", () => {
   const dialogs = new Api.messages.Dialogs({
@@ -148,29 +117,32 @@ test("dialogs cache accepts GramJS big-integer ids and access hashes", () => {
   });
 });
 
-test("pending request tracking supports multiple concurrent requests", async () => {
-  const env = fakeEnv();
-  await trackPendingRequest(env, "session-1", "msg-1", {
-    requestId: "req-1",
-    kind: "dialogs",
-    method: "messages.GetDialogs",
-    createdAt: 1,
+test("parseRpcResultFrame extracts correlation metadata from decrypted RPC results", async () => {
+  const object = {
+    className: "RPCResult",
+    reqMsgId: 123456789n,
+    body: new Api.messages.Dialogs({
+      dialogs: [],
+      messages: [],
+      chats: [],
+      users: [],
+    }),
+  };
+
+  assert.equal(classifyDecryptedFrame(object), "rpc_result");
+
+  const parsed = await parseRpcResultFrame(object, {
+    requestName: "messages.GetDialogs",
   });
-  await trackPendingRequest(env, "session-1", "msg-2", {
-    requestId: "req-2",
-    kind: "send_message",
-    method: "messages.SendMessage",
-    createdAt: 2,
+
+  assert.equal(parsed?.reqMsgId, "123456789");
+  assert.equal(parsed?.requestName, "messages.GetDialogs");
+  assert.equal(parsed?.resultClassName, "messages.Dialogs");
+  assert.deepEqual(parsed?.normalizedResult, {
+    className: "messages.Dialogs",
+    dialogs: [],
+    messages: [],
+    chats: [],
+    users: [],
   });
-
-  const before = await loadPendingRequests(env, "session-1");
-  assert.deepEqual(Object.keys(before).sort(), ["msg-1", "msg-2"]);
-
-  const first = await resolvePendingRequest(env, "session-1", "msg-1");
-  const second = await resolvePendingRequest(env, "session-1", "msg-2");
-  const after = await loadPendingRequests(env, "session-1");
-
-  assert.equal(first?.requestId, "req-1");
-  assert.equal(second?.requestId, "req-2");
-  assert.deepEqual(after, {});
 });

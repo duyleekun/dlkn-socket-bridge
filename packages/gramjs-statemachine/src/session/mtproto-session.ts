@@ -102,4 +102,3 @@ export function hydrateMtProtoState(
 export function readMtProtoSequence(state: RuntimeMtProtoState): number {
   return (state as unknown as { _sequence: number })._sequence;
 }
-

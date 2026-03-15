@@ -14,7 +14,34 @@ export { Api } from 'telegram/tl/index.js';
 export type { ApiMethodParams, ApiMethodPath } from './api/invoke.js';
 export { randomLong } from './api/invoke.js';
 export { resolveTelegramDc, getDefaultTelegramDc, parseMigrateDc } from './dc/dc-resolver.js';
-export { normalizeTlValue } from './dispatch/inbound-dispatch.js';
+export {
+  classifyDecryptedFrame,
+  getTlObjectClassName,
+  normalizeTlValue,
+  parseRpcResultFrame,
+  unwrapGzippedTlObject,
+} from './dispatch/inbound-dispatch.js';
+export type {
+  DecryptedFrameKind,
+  ParsedRpcResultFrame,
+} from './dispatch/inbound-dispatch.js';
+export type {
+  TelegramUpdatesState,
+  TelegramUpdatesStateSource,
+} from './dispatch/updates-state.js';
+export {
+  buildTelegramGetDifferenceParams,
+  extractTelegramUpdatesState,
+} from './dispatch/updates-state.js';
+export type {
+  ConversationCache,
+  ConversationOption,
+  ConversationPeerType,
+} from './conversation/conversation-helpers.js';
+export {
+  buildConversationCacheFromDialogs,
+  buildInputPeerFromConversation,
+} from './conversation/conversation-helpers.js';
 export {
   createSession,
   invokeSessionMethod,

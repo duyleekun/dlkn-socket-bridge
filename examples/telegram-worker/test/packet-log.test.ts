@@ -58,14 +58,13 @@ test("update packet log preserves inbound msgId and seqNo", async () => {
 
   await handleSessionEvents(env, sessionKey, state, state, bridge, [
     {
-      type: "update",
-      update: {
+      type: "decrypted_frame",
+      object: {
         className: "UpdateShort",
         update: { className: "UpdateUserStatus" },
       },
       msgId: "123456789",
       seqNo: 7,
-      envelopeClassName: "UpdateShort",
     },
   ]);
 
@@ -73,6 +72,7 @@ test("update packet log preserves inbound msgId and seqNo", async () => {
   assert.equal(log.length, 1);
   assert.equal(log[0]?.msgId, "123456789");
   assert.equal(log[0]?.seqNo, 7);
-  assert.equal(log[0]?.className, "UpdateShort");
-  assert.equal(log[0]?.envelopeClassName, "UpdateShort");
+  assert.equal(log[0]?.kind, "update");
+  assert.equal(log[0]?.topLevelClassName, "UpdateShort");
+  assert.equal(log[0]?.summary, "UpdateShort");
 });

@@ -1,20 +1,18 @@
 /**
  * Crypto helpers for MTProto 2.0 message encryption/decryption.
  *
- * Uses GramJS IGE helpers for encrypted message transport and preserves the
- * project's older MTProto 2.0 RSA padding for DH setup compatibility.
+ * Uses GramJS IGE helpers for encrypted message transport and a patched
+ * GramJS RSA helper for MTProto 2.0 DH padding.
  */
 
-import { createHash } from 'node:crypto';
-import bigInt from 'big-integer';
 import { IGE } from 'telegram/crypto/IGE.js';
-import { _serverKeys as gramjsServerKeys } from 'telegram/crypto/RSA.js';
+import {
+  encryptMtproto2 as gramjsEncryptMtproto2,
+} from 'telegram/crypto/RSA.js';
 import {
   sha1 as telegramSha1,
   sha256 as telegramSha256,
   generateRandomBytes,
-  readBigIntFromBuffer,
-  readBufferFromBigInt,
 } from 'telegram/Helpers.js';
 import { generateMessageId } from '../framing/plain-message.js';
 
@@ -50,114 +48,25 @@ export function aesIgeDecrypt(
   );
 }
 
-// ── MTProto 2.0 RSA padding (DH setup) ──────────────────────────────────────
-
-const TELEGRAM_RSA_KEYS = new Map<
-  string,
-  { n: ReturnType<typeof bigInt>; e: ReturnType<typeof bigInt> }
->();
-
-for (const [fingerprint, key] of gramjsServerKeys.entries()) {
-  const signedFingerprint = bigInt(fingerprint);
-  const two64 = bigInt('10000000000000000', 16);
-  const unsignedFingerprint = signedFingerprint.isNegative()
-    ? signedFingerprint.add(two64)
-    : signedFingerprint;
-
-  TELEGRAM_RSA_KEYS.set(unsignedFingerprint.toString(16).padStart(16, '0'), {
-    n: bigInt(key.n),
-    e: bigInt(key.e),
-  });
-}
-
-function sha1Sync(data: Uint8Array): Uint8Array {
-  return new Uint8Array(createHash('sha1').update(data).digest());
-}
-
-function sha256Sync(data: Uint8Array): Uint8Array {
-  return new Uint8Array(createHash('sha256').update(data).digest());
-}
-
-function concatBytes(...parts: Uint8Array[]): Uint8Array {
-  const total = parts.reduce((sum, part) => sum + part.length, 0);
-  const result = new Uint8Array(total);
-  let offset = 0;
-  for (const part of parts) {
-    result.set(part, offset);
-    offset += part.length;
-  }
-  return result;
-}
-
-function xorBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
-  if (left.length !== right.length) {
-    throw new Error(`xorBytes length mismatch: ${left.length} !== ${right.length}`);
-  }
-
-  const result = new Uint8Array(left.length);
-  for (let index = 0; index < left.length; index += 1) {
-    result[index] = left[index]! ^ right[index]!;
-  }
-  return result;
-}
-
-function bigIntFromBytes(bytes: Uint8Array): ReturnType<typeof bigInt> {
-  return readBigIntFromBuffer(Buffer.from(bytes), false, false);
-}
-
-function bigIntToBytes(
-  value: ReturnType<typeof bigInt>,
-  length: number,
-): Uint8Array {
-  return new Uint8Array(readBufferFromBigInt(value, length, false, false));
-}
-
 function defaultRandomBytes(size: number): Uint8Array {
   return new Uint8Array(generateRandomBytes(size));
 }
 
 /**
  * MTProto 2.0 RSA padding used during DH setup.
- *
- * GramJS' generic RSA helper produces a server-rejected `req_DH_params` for the
- * refactored flow, so we intentionally preserve the older project-specific
- * padding that previously worked against Telegram.
  */
-export function rsaEncryptMtproto2(
+export async function rsaEncryptMtproto2(
   data: Uint8Array,
   fingerprintHex: string,
   randomBytes: (size: number) => Uint8Array = defaultRandomBytes,
-): Uint8Array {
-  const key = TELEGRAM_RSA_KEYS.get(fingerprintHex);
-  if (!key) {
-    throw new Error(`unknown RSA key fingerprint: ${fingerprintHex}`);
-  }
-  if (data.length > 144) {
-    throw new Error(`rsaEncryptMtproto2: data too long (${data.length} > 144)`);
-  }
-
-  const padding = randomBytes(192 - data.length);
-  const dataWithPadding = concatBytes(data, padding);
-  const dataPadReversed = dataWithPadding.slice().reverse();
-
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const tempKey = randomBytes(32);
-    const shaDigest = sha256Sync(concatBytes(tempKey, dataWithPadding));
-    const dataWithHash = concatBytes(dataPadReversed, shaDigest);
-    const aesEncrypted = aesIgeEncrypt(dataWithHash, tempKey, new Uint8Array(32));
-    const tempKeyXor = xorBytes(tempKey, sha256Sync(aesEncrypted));
-    const keyAesEncrypted = concatBytes(tempKeyXor, aesEncrypted);
-    const keyAesInt = bigIntFromBytes(keyAesEncrypted);
-
-    if (keyAesInt.greaterOrEquals(key.n)) {
-      continue;
-    }
-
-    const encrypted = keyAesInt.modPow(key.e, key.n);
-    return bigIntToBytes(encrypted, 256);
-  }
-
-  throw new Error('rsaEncryptMtproto2: failed to find valid padding after 20 retries');
+): Promise<Uint8Array> {
+  return new Uint8Array(
+    await gramjsEncryptMtproto2(
+      Buffer.from(data),
+      fingerprintHex,
+      (size) => Buffer.from(randomBytes(size)),
+    ),
+  );
 }
 
 // ── MTProto 2.0 message key derivation ───────────────────────────────────────

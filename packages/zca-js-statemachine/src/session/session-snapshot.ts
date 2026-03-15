@@ -21,7 +21,6 @@ export interface SessionSnapshot {
 
 export type ZaloSessionHostEvent =
   | { type: 'inbound_frame'; frame: Uint8Array }
-  | { type: 'ws_connected' }
   | { type: 'ws_closed'; code: number; reason: string }
   | { type: 'http_login_qr_result'; qrData: { image: string; token: string; expiresAt: number } }
   | { type: 'qr_scan_event'; event: 'scanned' | 'confirmed' | 'declined' | 'expired'; data?: unknown }

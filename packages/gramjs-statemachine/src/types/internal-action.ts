@@ -1,25 +1,7 @@
 /**
- * Internal reducer outputs used inside the state machine runtime.
- *
- * These are not the public host-facing events. `transitionSession()` converts the
- * observable subset into `SessionEvent` and consumes the protocol-only entries
- * internally.
+ * Internal reducer outputs used only for protocol/session transitions.
  */
 export type InternalAction =
-  | {
-      type: 'rpc_result';
-      reqMsgId: string;
-      requestName: string;
-      result: unknown;
-      requestId?: string;
-    }
-  | {
-      type: 'update';
-      update: unknown;
-      msgId: string;
-      seqNo: number;
-      envelopeClassName?: string;
-    }
   | { type: 'new_salt'; salt: string }
   | { type: 'bad_msg'; errorCode: number; badMsgId: string }
   | { type: 'ack'; msgIds: string[] }

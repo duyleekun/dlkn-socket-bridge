@@ -7,7 +7,10 @@
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
     "dev:bridge": "pnpm --stream --filter dlkn-socket-bridge-rs run dev",
-    "dev:telegram": "pnpm --parallel --stream --filter dlkn-socket-bridge-rs --filter telegram-worker run dev",
-    "dev:zalo": "pnpm --parallel --stream --filter dlkn-socket-bridge-rs --filter zalo-worker run dev"
+    "dev:telegram": "concurrently --kill-others-on-fail --names bridge,telegram \"pnpm --filter dlkn-socket-bridge-rs run dev\" \"pnpm --filter telegram-worker run dev\"",
+    "dev:zalo": "concurrently --kill-others-on-fail --names bridge,zalo \"pnpm --filter dlkn-socket-bridge-rs run dev\" \"pnpm --filter zalo-worker run dev\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
   }
 }

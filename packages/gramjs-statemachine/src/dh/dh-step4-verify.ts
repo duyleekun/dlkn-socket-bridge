@@ -5,7 +5,6 @@
  */
 
 import { generateRandomBytes } from 'telegram/Helpers.js';
-import { BinaryReader } from 'telegram/extensions/index.js';
 
 import type { SerializedState } from '../types/state.js';
 import type { StepResult } from '../types/step-result.js';
@@ -14,6 +13,7 @@ import { unwrapPlainMessage } from '../framing/plain-message.js';
 import { toHex, fromHex } from '../session/crypto.js';
 import { createGramJsAuthKey } from '../session/auth-key.js';
 import { bigIntFromBytesLE } from '../session/bigint-helpers.js';
+import { readTlObject } from '../tl/read-object.js';
 
 export async function handleDhGenResult(
   state: SerializedState,
@@ -22,9 +22,8 @@ export async function handleDhGenResult(
   // 1. Strip transport frame + unwrap plain message + deserialize
   const stripped = stripTransportFrame(inbound);
   const { body } = unwrapPlainMessage(stripped);
-  const reader = new BinaryReader(Buffer.from(body));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const result = await Promise.resolve(reader.tgReadObject()) as any;
+  const result = await readTlObject(body) as any;
 
   if (result.className === 'DhGenOk') {
     // 2. Verify new_nonce_hash1

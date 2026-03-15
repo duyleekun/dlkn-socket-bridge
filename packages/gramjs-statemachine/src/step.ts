@@ -3,7 +3,10 @@ import { hydrateMtProtoState } from './session/mtproto-session.js';
 import { handleResPq } from './dh/dh-step2-server-dh.js';
 import { handleServerDHParams } from './dh/dh-step3-client-dh.js';
 import { handleDhGenResult } from './dh/dh-step4-verify.js';
-import { dispatchDecodedObject } from './dispatch/inbound-dispatch.js';
+import {
+  dispatchDecodedObject,
+  getTlObjectClassName,
+} from './dispatch/inbound-dispatch.js';
 import type { SerializedState } from './types/state.js';
 import type { StepResult } from './types/step-result.js';
 
@@ -62,25 +65,32 @@ async function stepEncrypted(
   const payload = stripTransportFrame(inbound);
   const mtprotoState = hydrateMtProtoState(state);
   const message = await mtprotoState.decryptMessageData(Buffer.from(payload));
-  const object = await Promise.resolve(message.obj);
   const msgId = BigInt(message.msgId.toString());
   const seqNo = (message as unknown as { seqNo: number }).seqNo;
 
-  const { actions, updatedState } = await dispatchDecodedObject(
+  const { actions, updatedState, object, parsedRpc } = await dispatchDecodedObject(
     state,
-    object,
+    await Promise.resolve(message.obj),
     msgId,
     seqNo,
   );
   console.debug('[gramjs-statemachine] stepEncrypted', {
     phase: state.phase,
     inboundFrameLength: inbound.length,
-    decryptedObjectClassName: (object as { className?: string } | null)?.className
-      ?? (object as { constructor?: { name?: string } } | null)?.constructor?.name,
+    decryptedObjectClassName: getTlObjectClassName(object),
     msgId: msgId.toString(),
     seqNo,
     actionTypes: actions.map((action) => action.type),
     nextPhase: updatedState.phase,
   });
-  return { nextState: updatedState, actions };
+  return {
+    nextState: updatedState,
+    actions,
+    decryptedFrame: {
+      msgId: msgId.toString(),
+      seqNo,
+      object,
+      requestName: parsedRpc?.requestName,
+    },
+  };
 }

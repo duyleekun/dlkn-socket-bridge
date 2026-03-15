@@ -24,7 +24,6 @@ function createTransitionMachine(initial: ZaloStateMachineValue) {
       robot3Api.transition('logout', 'idle') as never,
     ),
     qr_connecting: robot3Api.state(
-      robot3Api.transition('ws_connected', 'qr_connecting') as never,
       robot3Api.transition('ws_closed', 'qr_connecting') as never,
       robot3Api.transition('http_login_qr_result', 'qr_connecting') as never,
       robot3Api.transition('http_login_creds_result', 'qr_connecting') as never,
@@ -49,7 +48,6 @@ function createTransitionMachine(initial: ZaloStateMachineValue) {
     ),
     logged_in: robot3Api.state(),
     ws_connecting: robot3Api.state(
-      robot3Api.transition('ws_connected', 'ws_connecting') as never,
       robot3Api.transition('ws_closed', 'ws_connecting') as never,
       robot3Api.transition('inbound_frame', 'ws_connecting') as never,
     ),
@@ -59,7 +57,6 @@ function createTransitionMachine(initial: ZaloStateMachineValue) {
       robot3Api.transition('logout', 'listening') as never,
     ),
     reconnecting: robot3Api.state(
-      robot3Api.transition('ws_connected', 'reconnecting') as never,
       robot3Api.transition('ws_closed', 'reconnecting') as never,
       robot3Api.transition('inbound_frame', 'reconnecting') as never,
     ),

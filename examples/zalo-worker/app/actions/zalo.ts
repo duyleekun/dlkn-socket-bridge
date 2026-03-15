@@ -8,6 +8,7 @@ import type {
   ZaloMessage,
   BridgeSession,
   SocketStatus,
+  SocketActivityEntry,
 } from "../../worker/types";
 import { normalizeUrl } from "../../worker/bridge-url";
 import { executeSessionCommands } from "../../worker/bridge-session";
@@ -46,9 +47,11 @@ import {
   validatePersistedSession,
 } from "../../worker/zalo-login";
 import {
-  appendMessage,
+  buildRecoveryCommands,
   cloneRuntimeArtifacts,
   loadMessageLog,
+  resolveMessageRecoveryCursor,
+  loadSocketActivityLog,
 } from "../../worker/runtime-store";
 import { cleanupSocket } from "../../worker/socket-health";
 import type { BridgeSocketHealth } from "../../worker/socket-health";
@@ -640,17 +643,6 @@ export async function sendZaloMessage(
       response.message?.msgId != null
         ? String(response.message.msgId)
         : `local-${Date.now()}`;
-    const senderId = persisted.userProfile?.uid || trimmedThreadId;
-
-    await appendMessage(env, sessionKey, {
-      id: messageId,
-      threadId: targetThreadId,
-      threadType,
-      fromId: senderId,
-      content: trimmedText,
-      timestamp: Date.now(),
-      msgType: "chat.message.self_send",
-    });
 
     return { ok: true, messageId };
   } catch (error) {
@@ -666,4 +658,83 @@ export async function sendZaloMessage(
 export async function getMessageLog(sessionKey: string): Promise<ZaloMessage[]> {
   const env = getEnv();
   return loadMessageLog(env, sessionKey);
+}
+
+export async function getSocketActivityLog(
+  sessionKey: string,
+): Promise<SocketActivityEntry[]> {
+  const env = getEnv();
+  return loadSocketActivityLog(env, sessionKey);
+}
+
+export async function fetchMissingZaloEvents(
+  sessionKey: string,
+): Promise<{
+  ok: boolean;
+  error?: string;
+  requestedDm: boolean;
+  requestedGroup: boolean;
+}> {
+  const env = getEnv();
+  if (!sessionKey) {
+    return {
+      ok: false,
+      error: "Session key is required.",
+      requestedDm: false,
+      requestedGroup: false,
+    };
+  }
+
+  const loaded = await loadBoth(env, sessionKey);
+  if (!loaded) {
+    return {
+      ok: false,
+      error: "Session not found.",
+      requestedDm: false,
+      requestedGroup: false,
+    };
+  }
+
+  if (loaded.state.value !== "listening") {
+    return {
+      ok: false,
+      error: "Realtime socket is not ready yet.",
+      requestedDm: false,
+      requestedGroup: false,
+    };
+  }
+
+  const cursor = await resolveMessageRecoveryCursor(env, sessionKey);
+  const commands = buildRecoveryCommands(cursor);
+
+  if (commands.length === 0) {
+    return {
+      ok: false,
+      error: "No DM or group recovery cursor is available yet.",
+      requestedDm: false,
+      requestedGroup: false,
+    };
+  }
+
+  try {
+    await executeSessionCommands(
+      env,
+      normalizeUrl(env.WORKER_URL),
+      sessionKey,
+      loaded.bridge,
+      commands,
+    );
+    return {
+      ok: true,
+      requestedDm: Boolean(cursor.lastUserMessageId),
+      requestedGroup: Boolean(cursor.lastGroupMessageId),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+      requestedDm: false,
+      requestedGroup: false,
+    };
+  }
 }
