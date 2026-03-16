@@ -10,7 +10,6 @@ import {
   persistSessionCookie,
   restoreSessionFromCookie,
 } from "../actions/zalo";
-import { StatusBadge } from "./StatusBadge";
 import { SocketActivityLog } from "./SocketActivityLog";
 import { QRDisplay } from "./QRDisplay";
 import {
@@ -18,6 +17,13 @@ import {
   ZALO_STEPS,
   getZaloStepperState,
 } from "./AuthStepper";
+import {
+  ActionGrid,
+  AgentPanelShell,
+  PanelButton,
+  PanelMessage,
+  PanelSection,
+} from "./AgentPanel";
 
 interface ZaloPanelProps {
   instanceId: string;
@@ -92,6 +98,17 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
   const [actionFeedback, setActionFeedback] = useState<string | null>(null);
   const shouldRecoverRef = useRef(false);
 
+  function resetToDefaultInstance() {
+    setResolvedInstanceId(instanceId);
+    setState(DEFAULT_ZALO_STATE);
+    setBridgeStatus(null);
+    setRecoverySnapshot(null);
+    setLoadedMessages(null);
+    setFullActivity(null);
+    setActionFeedback(null);
+    shouldRecoverRef.current = false;
+  }
+
   useEffect(() => {
     let active = true;
     void restoreSessionFromCookie()
@@ -122,7 +139,20 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
   useEffect(() => {
     if (!ready || !shouldRecoverRef.current) return;
     shouldRecoverRef.current = false;
-    void (agent.call("recoverSession", [{ requestOrigin: window.location.origin }]) as Promise<unknown>).catch(() => {
+    void (agent.call("recoverSession", [{ requestOrigin: window.location.origin }]) as Promise<
+      { ok: true; lastEventSeq: number; lastEventAt: number | null; reconnectCount: number }
+      | { ok: false; error: string }
+    >).then(async (result) => {
+      if (result.ok) return;
+      if (
+        result.error === "No persisted credentials" &&
+        resolvedInstanceId !== instanceId
+      ) {
+        await clearSessionCookie();
+        resetToDefaultInstance();
+        shouldRecoverRef.current = true;
+      }
+    }).catch(() => {
       // Ignore stale-cookie recovery failures; the panel remains usable.
     });
   }, [agent, ready, resolvedInstanceId]);
@@ -157,6 +187,16 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
       | { ok: true; lastEventSeq: number; lastEventAt: number | null; reconnectCount: number }
       | { ok: false; error: string };
     if (!result.ok) {
+      if (
+        result.error === "No persisted credentials" &&
+        resolvedInstanceId !== instanceId
+      ) {
+        await clearSessionCookie();
+        resetToDefaultInstance();
+        shouldRecoverRef.current = true;
+        setActionFeedback("Retrying recovery on default instance.");
+        return;
+      }
       setActionFeedback(result.error);
       return;
     }
@@ -218,36 +258,28 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
   async function handleLogout() {
     await agent.call("logout", []);
     await clearSessionCookie();
-    setBridgeStatus(null);
-    setRecoverySnapshot(null);
-    setLoadedMessages(null);
-    setFullActivity(null);
-    setActionFeedback(null);
-    setResolvedInstanceId(crypto.randomUUID());
+    resetToDefaultInstance();
+  }
+
+  async function handleClearLocalSession() {
+    await clearSessionCookie();
+    resetToDefaultInstance();
   }
 
   const activityEntries = mergeActivityEntries(fullActivity, state.socketActivity);
   const displayedMessages = loadedMessages ?? [];
 
   return (
-    <div className="card p-6 space-y-5">
-      <div className="flex items-start justify-between gap-3">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2">
-            <div className="h-3 w-3 rounded-full bg-zalo" />
-            <p className="text-xs font-semibold uppercase tracking-widest text-muted">
-              Zalo
-            </p>
-          </div>
-          <StatusBadge phase={phase} socketStatus={socketStatus} />
-          <p className="text-[11px] text-muted">Instance: {resolvedInstanceId}</p>
-        </div>
-      </div>
+    <AgentPanelShell
+      accentClassName="bg-zalo"
+      instanceId={resolvedInstanceId}
+      phase={phase}
+      socketStatus={socketStatus}
+      title="Zalo"
+    >
 
       {!ready && (
-        <div className="rounded-lg border border-card-border bg-surface p-4 text-sm text-muted">
-          Restoring session context...
-        </div>
+        <PanelMessage>Restoring session context...</PanelMessage>
       )}
 
       {phase !== "idle" && phase !== "error" && (
@@ -259,17 +291,21 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
       )}
 
       {phase === "idle" && ready && (
-        <div className="space-y-4">
+        <PanelSection
+          title="Start session"
+          description="Zalo signs in through QR confirmation in the mobile app."
+        >
           <p className="text-sm text-muted">
             Zalo uses QR-based authentication. Click below to generate a QR code.
           </p>
-          <button
+          <PanelButton
             onClick={() => void handleStartQR()}
-            className="w-full rounded-lg bg-zalo px-4 py-2.5 text-sm font-medium text-white hover:opacity-90 transition-opacity"
+            fullWidth
+            className="bg-zalo text-white hover:opacity-90"
           >
-            Scan QR Code
-          </button>
-        </div>
+            Start session
+          </PanelButton>
+        </PanelSection>
       )}
 
       {phase === "qr_pending" && (
@@ -284,7 +320,7 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
       )}
 
       {phase === "qr_scanned" && (
-        <div className="rounded-lg border border-success/30 bg-success/10 p-4 text-center space-y-3">
+        <PanelMessage tone="success">
           <div className="animate-spin h-8 w-8 border-3 border-success border-t-transparent rounded-full mx-auto" />
           <p className="text-sm font-medium text-success">
             QR Scanned! Waiting for confirmation...
@@ -292,24 +328,60 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
           <p className="text-xs text-muted">
             Confirm the login on your Zalo mobile app.
           </p>
-        </div>
+        </PanelMessage>
       )}
 
       {phase === "authenticating" && (
-        <div className="flex flex-col items-center gap-3 py-6">
-          <div className="animate-spin h-8 w-8 border-3 border-zalo border-t-transparent rounded-full" />
-          <p className="text-sm text-muted">Connecting to Zalo...</p>
+        <div className="space-y-3">
+          <div className="flex flex-col items-center gap-3 py-6">
+            <div className="animate-spin h-8 w-8 border-3 border-zalo border-t-transparent rounded-full" />
+            <p className="text-sm text-muted">Finishing Zalo sign-in...</p>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <PanelButton
+              onClick={() => void handleLogout()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Logout
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Clear local session
+            </PanelButton>
+          </div>
         </div>
       )}
 
       {phase === "recovering" && (
         <div className="space-y-3">
-          <div className="rounded-lg border border-warning/30 bg-warning/10 p-4 text-center">
+          <PanelMessage tone="warning">
             <div className="animate-spin h-8 w-8 border-3 border-warning border-t-transparent rounded-full mx-auto mb-3" />
             <p className="text-sm font-medium text-warning">Reconnecting...</p>
             <p className="text-xs text-muted mt-1">
-              Re-establishing connection to Zalo servers.
+              Establishing or re-establishing the realtime Zalo socket.
             </p>
+          </PanelMessage>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <PanelButton
+              onClick={() => void handleCheckSocket()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Refresh bridge
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleLogout()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Logout
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Clear local session
+            </PanelButton>
           </div>
         </div>
       )}
@@ -380,47 +452,49 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
             </div>
           </div>
 
-          <div className="grid gap-2 sm:grid-cols-2">
-            <button
+          <ActionGrid>
+            <PanelButton
               onClick={() => void handleRecover()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm text-foreground hover:bg-zinc-800"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800"
             >
-              Recover Session
-            </button>
-            <button
+              Recover session
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleCheckSocket()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm text-foreground hover:bg-zinc-800"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800"
             >
-              Check Socket
-            </button>
-            <button
+              Refresh bridge
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleLoadRecovery()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm text-foreground hover:bg-zinc-800"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800"
             >
-              Refresh Recovery
-            </button>
-            <button
+              Refresh recovery
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleFetchMissing()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm text-foreground hover:bg-zinc-800"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800"
             >
-              Fetch Missing Events
-            </button>
-            <button
+              Fetch missing events
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleLoadMessages()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm text-foreground hover:bg-zinc-800"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800"
             >
-              Load Messages
-            </button>
-            <button
+              Load messages
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleLoadActivity()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm text-foreground hover:bg-zinc-800"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800"
             >
-              Load Full Activity
-            </button>
-          </div>
+              Load activity
+            </PanelButton>
+          </ActionGrid>
 
-          <div className="space-y-3 rounded-lg border border-card-border bg-surface p-4">
-            <p className="text-sm font-semibold text-foreground">Send Message</p>
+          <PanelSection
+            title="Send message"
+            description="Use the persisted session to post into a direct message or group."
+          >
             <input
               value={threadId}
               onChange={(event) => setThreadId(event.target.value)}
@@ -443,20 +517,26 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
               className="w-full rounded-lg border border-card-border bg-background px-3 py-2 text-sm text-foreground outline-none ring-zalo focus:ring-2"
             />
             <div className="flex gap-2">
-              <button
+              <PanelButton
                 onClick={() => void handleSendMessage()}
-                className="flex-1 rounded-lg bg-zalo px-4 py-2.5 text-sm font-medium text-white hover:opacity-90"
+                className="flex-1 bg-zalo text-white hover:opacity-90"
               >
                 Send
-              </button>
-              <button
+              </PanelButton>
+              <PanelButton
                 onClick={() => void handleLogout()}
-                className="rounded-lg border border-card-border bg-background px-4 py-2.5 text-sm font-medium text-foreground hover:bg-zinc-800"
+                className="border border-card-border bg-background text-foreground hover:bg-zinc-800"
               >
                 Logout
-              </button>
+              </PanelButton>
+              <PanelButton
+                onClick={() => void handleClearLocalSession()}
+                className="border border-card-border bg-background text-foreground hover:bg-zinc-800"
+              >
+                Clear local session
+              </PanelButton>
             </div>
-          </div>
+          </PanelSection>
 
           {displayedMessages.length > 0 && (
             <div className="space-y-2">
@@ -487,36 +567,41 @@ export default function ZaloPanel({ instanceId }: ZaloPanelProps) {
 
       {phase === "error" && (
         <div className="space-y-3">
-          <div className="rounded-lg border border-error/30 bg-error/10 p-4">
-            <p className="text-sm font-medium text-error">Error</p>
-            <p className="text-xs text-error/80 mt-1">
-              {error || "Unknown error"}
-            </p>
-          </div>
+          <PanelMessage tone="error">
+            <p className="font-medium">Error</p>
+            <p className="mt-1 text-xs">{error || "Unknown error"}</p>
+          </PanelMessage>
           <div className="grid gap-2 sm:grid-cols-2">
-            <button
+            <PanelButton
               onClick={() => void handleRetry()}
-              className="w-full rounded-lg bg-surface border border-card-border px-4 py-2.5 text-sm font-medium text-foreground hover:bg-zinc-800 transition-colors"
+              fullWidth
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
             >
-              Try Again
-            </button>
-            <button
+              Retry
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleRecover()}
-              className="w-full rounded-lg bg-surface border border-card-border px-4 py-2.5 text-sm font-medium text-foreground hover:bg-zinc-800 transition-colors"
+              fullWidth
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
             >
-              Recover Session
-            </button>
+              Recover session
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              fullWidth
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Clear local session
+            </PanelButton>
           </div>
         </div>
       )}
 
       {actionFeedback && (
-        <div className="rounded-lg border border-card-border bg-surface p-3 text-xs text-muted">
-          {actionFeedback}
-        </div>
+        <PanelMessage>{actionFeedback}</PanelMessage>
       )}
 
       {phase !== "idle" && <SocketActivityLog entries={activityEntries} />}
-    </div>
+    </AgentPanelShell>
   );
 }

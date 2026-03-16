@@ -7,17 +7,21 @@
  *   3. Bridge POSTs inbound frames to /cb/:callbackKey → pushFrame() → state machine.
  *   4. Auto-reconnect on socket close when authenticated.
  */
-import { Agent, unstable_callable as callable, type Connection } from "agents";
+import { unstable_callable as callable, type Connection } from "agents";
 import { ThreadType } from "zca-js";
 import {
-  createSession as createZaloSession,
-  transitionSession,
-  selectSessionView,
+  sessionRuntimeAdapter as zaloRuntime,
   buildPingFrame,
   buildOldMessagesFrame,
   buildZaloWsHeaders,
   extractSocketMessages,
+  type CreateSessionInput,
+  type SessionCommand,
+  type SessionEvent,
+  type SessionHostEvent,
   type SessionSnapshot,
+  type SessionStateValue,
+  type SessionView,
   type ZaloSessionCommand,
   type ZaloSessionEvent,
   type ZaloSessionHostEvent,
@@ -33,20 +37,20 @@ import {
   resolveSelfThreadId,
   validatePersistedSession,
   type QRLoginResult,
-} from "./shared/zalo-login";
+} from "./zalo/zalo-login";
 import {
-  createSession as createBridgeSession,
   getStatus as getBridgeSessionStatus,
   sendBytes,
-  closeSession,
 } from "./shared/bridge-client";
-import { normalizeUrl, resolveBridgeUrl } from "./shared/bridge-url";
+import {
+  StateMachineBridgeAgent,
+  type BridgeConnectionInfo,
+} from "./shared/base-agent";
 import type {
   Env,
   ZaloState,
   ZaloPhase,
   SocketActivity,
-  CallbackRecord,
   BridgeStatusResponse,
 } from "./shared/types";
 import { DEFAULT_ZALO_STATE } from "./shared/types";
@@ -70,26 +74,6 @@ CREATE TABLE IF NOT EXISTS zalo_messages (
 );
 `;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function toActivity(
-  kind: SocketActivity["kind"],
-  label: string,
-  byteLen?: number,
-): SocketActivity {
-  return {
-    id: crypto.randomUUID(),
-    kind,
-    label,
-    byteLen,
-    ts: Date.now(),
-  };
-}
-
-function trimActivity(list: SocketActivity[], max = 50): SocketActivity[] {
-  return list.length > max ? list.slice(-max) : list;
-}
-
 function mapPhase(smValue: string): ZaloPhase {
   switch (smValue) {
     case "idle":
@@ -100,9 +84,10 @@ function mapPhase(smValue: string): ZaloPhase {
     case "qr_scanned":
       return "qr_scanned";
     case "cred_logging_in":
+      return "authenticating";
     case "ws_connecting":
     case "logged_in":
-      return "authenticating";
+      return "recovering";
     case "listening":
       return "authenticated";
     case "reconnecting":
@@ -169,8 +154,20 @@ function toBroadcastUserProfile(
 
 // ── ZaloAgent ────────────────────────────────────────────────────────────────
 
-export class ZaloAgent extends Agent<Env, ZaloState> {
+export class ZaloAgent extends StateMachineBridgeAgent<
+  ZaloState,
+  CreateSessionInput,
+  SessionHostEvent,
+  SessionSnapshot,
+  SessionStateValue,
+  SessionCommand,
+  SessionEvent,
+  SessionView
+> {
   initialState = DEFAULT_ZALO_STATE;
+  protected readonly platform = "zalo" as const;
+  protected readonly runtimeAdapter = zaloRuntime;
+  protected override activityStateLimit = 50;
 
   // Internal mutable state (not broadcast — persisted in SQL)
   private snapshot: SessionSnapshot | null = null;
@@ -202,16 +199,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     connection.send(JSON.stringify(this.state));
   }
 
-  // ── Safe instance name (workaround for workerd#2240) ───────────────────
-  private instanceId(): string {
-    try {
-      return (this.ctx.id as DurableObjectId & { name?: string }).name ?? this.ctx.id.toString();
-    } catch {
-      return this.ctx.id.toString();
-    }
-  }
-
-  private normalizeBroadcastState(nextState: ZaloState): ZaloState {
+  protected override normalizeState(nextState: ZaloState): ZaloState {
     const normalized: ZaloState = {
       ...nextState,
       userProfile:
@@ -230,21 +218,6 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     }
 
     return normalized;
-  }
-
-  private replaceState(nextState: ZaloState): void {
-    this.setState(this.normalizeBroadcastState(nextState));
-  }
-
-  private patchState(
-    patch: Partial<ZaloState>,
-    updatedAt = Date.now(),
-  ): void {
-    this.replaceState({
-      ...this.state,
-      ...patch,
-      updatedAt: patch.updatedAt ?? updatedAt,
-    });
   }
 
   // ── SQL helpers ──────────────────────────────────────────────────────────
@@ -318,20 +291,20 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     }));
   }
 
-  private kvGet(key: string): string | null {
+  protected override kvGet(key: string): string | null {
     const rows = this.sql<{ value: string }>`
       SELECT value FROM zalo_session WHERE key = ${key}
     `;
     return rows.length > 0 ? rows[0].value : null;
   }
 
-  private kvSet(key: string, value: string): void {
+  protected override kvSet(key: string, value: string): void {
     this.sql`
       INSERT OR REPLACE INTO zalo_session (key, value) VALUES (${key}, ${value})
     `;
   }
 
-  private kvDel(key: string): void {
+  protected override kvDel(key: string): void {
     this.sql`DELETE FROM zalo_session WHERE key = ${key}`;
   }
 
@@ -490,11 +463,11 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     const pingRaw = this.kvGet("ping_interval_ms");
     if (pingRaw) this.pingIntervalMs = parseInt(pingRaw, 10) || 20_000;
 
-    const bridgeRaw = this.kvGet("bridge_socket_id");
-    if (bridgeRaw) this.bridgeSocketId = bridgeRaw;
-
-    const cbRaw = this.kvGet("callback_key");
-    if (cbRaw) this.callbackKey = cbRaw;
+    const bridge = this.loadBridgeInfo();
+    if (bridge) {
+      this.bridgeSocketId = bridge.socketId;
+      this.callbackKey = bridge.callbackKey;
+    }
 
     const seqRaw = this.kvGet("last_event_seq");
     this.lastEventSeq = seqRaw ? Number(seqRaw) || 0 : 0;
@@ -547,20 +520,6 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     }
   }
 
-  private resolveRequestOrigin(origin?: string): string {
-    if (origin) {
-      const normalizedOrigin = normalizeUrl(origin);
-      this.kvSet("request_origin", normalizedOrigin);
-      return normalizedOrigin;
-    }
-
-    const persistedOrigin = this.kvGet("request_origin");
-    if (!persistedOrigin) {
-      throw new Error("Missing request origin");
-    }
-    return persistedOrigin;
-  }
-
   private persistCredentials(
     creds: ZaloCredentials,
     profile: ZaloUserProfile,
@@ -581,8 +540,6 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     this.credentials = null;
     this.userProfile = null;
     this.wsUrl = null;
-    this.bridgeSocketId = null;
-    this.callbackKey = null;
     this.lastEventSeq = 0;
     this.lastEventAt = null;
     this.reconnectCount = 0;
@@ -594,8 +551,6 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
       "credentials",
       "user_profile",
       "ws_url",
-      "bridge_socket_id",
-      "callback_key",
       "snapshot",
       "last_event_seq",
       "last_event_at",
@@ -607,73 +562,56 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     ]) {
       this.kvDel(key);
     }
+    this.clearBridgeInfo();
   }
 
-  private persistBridgeInfo(socketId: string, callbackKey: string): void {
-    this.bridgeSocketId = socketId;
-    this.callbackKey = callbackKey;
-    this.kvSet("bridge_socket_id", socketId);
-    this.kvSet("callback_key", callbackKey);
+  protected override saveBridgeInfo(info: BridgeConnectionInfo): void {
+    super.saveBridgeInfo(info);
+    this.bridgeSocketId = info.socketId;
+    this.callbackKey = info.callbackKey;
+  }
+
+  protected override clearBridgeInfo(): void {
+    super.clearBridgeInfo();
+    this.bridgeSocketId = null;
+    this.callbackKey = null;
+  }
+
+  protected override onActivity(entry: SocketActivity): void {
+    this.persistActivity(entry);
   }
 
   // ── Bridge socket management ─────────────────────────────────────────────
 
   private async createBridgeSocket(
     wsUrl: string,
-    headers?: Record<string, string>,
+  headers?: Record<string, string>,
   ): Promise<{ socketId: string; callbackKey: string }> {
-    const newCallbackKey = crypto.randomUUID();
-    const bridgeUrl = resolveBridgeUrl(this.env.BRIDGE_URL);
-    const callbackUrl = `${this.resolveRequestOrigin()}/cb/${newCallbackKey}`;
-
-    const resp = await createBridgeSession(bridgeUrl, wsUrl, callbackUrl, {
+    const bridge = await this.createBridgeConnection(wsUrl, {
       headers,
     });
-
-    // Register callback in KV
-    const record: CallbackRecord = {
-      platform: "zalo",
-      instanceId: this.instanceId(),
-    };
-    await this.env.BRIDGE_KV.put(
-      `callback:${newCallbackKey}`,
-      JSON.stringify(record),
-    );
-
-    this.persistBridgeInfo(resp.socket_id, newCallbackKey);
-
-    return { socketId: resp.socket_id, callbackKey: newCallbackKey };
+    return { socketId: bridge.socketId, callbackKey: bridge.callbackKey };
   }
 
   private async closeBridgeSocket(): Promise<void> {
-    if (this.bridgeSocketId) {
-      const bridgeUrl = resolveBridgeUrl(this.env.BRIDGE_URL);
-      try {
-        await closeSession(bridgeUrl, this.bridgeSocketId);
-      } catch (err) {
-        console.warn("[ZaloAgent] closeBridgeSocket error:", err);
-      }
+    try {
+      await this.closeBridgeConnection();
+    } catch (err) {
+      console.warn("[ZaloAgent] closeBridgeSocket error:", err);
     }
-    if (this.callbackKey) {
-      await this.env.BRIDGE_KV.delete(`callback:${this.callbackKey}`);
-    }
-    this.bridgeSocketId = null;
-    this.callbackKey = null;
-    this.kvDel("bridge_socket_id");
-    this.kvDel("callback_key");
   }
 
   private async sendToBridge(data: Uint8Array): Promise<void> {
-    if (!this.bridgeSocketId) {
+    const bridge = this.loadBridgeInfo();
+    if (!bridge) {
       throw new Error("No active bridge socket");
     }
-    const bridgeUrl = resolveBridgeUrl(this.env.BRIDGE_URL);
-    await sendBytes(bridgeUrl, this.bridgeSocketId, data);
-    this.addActivity(
-      "frame_out",
-      `Outbound frame (${data.byteLength}B)`,
-      data.byteLength,
-    );
+    await sendBytes(bridge.bridgeUrl, bridge.socketId, data);
+    this.addActivity({
+      kind: "frame_out",
+      label: `Outbound frame (${data.byteLength}B)`,
+      byteLen: data.byteLength,
+    });
   }
 
   // ── Ping management ──────────────────────────────────────────────────────
@@ -703,6 +641,16 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     commands: ZaloSessionCommand[],
   ): Promise<void> {
     for (const cmd of commands) {
+      console.log(
+        "[ZaloAgent] executeCommands",
+        JSON.stringify({
+          type: cmd.type,
+          hasBridge: this.loadBridgeInfo() != null,
+          hasCredentials: this.credentials != null,
+          phase: this.state.phase,
+        }),
+      );
+
       switch (cmd.type) {
         case "send_ping": {
           try {
@@ -729,6 +677,13 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
 
         case "reconnect": {
           // Close old socket, create new one
+          console.log(
+            "[ZaloAgent] reconnect command",
+            JSON.stringify({
+              wsUrl: cmd.wsUrl,
+              hasHeaders: Boolean(cmd.headers && Object.keys(cmd.headers).length > 0),
+            }),
+          );
           await this.closeBridgeSocket();
           const headers =
             cmd.headers ??
@@ -736,7 +691,10 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
               ? buildZaloWsHeaders(this.credentials, cmd.wsUrl)
               : undefined);
           await this.createBridgeSocket(cmd.wsUrl, headers);
-          this.addActivity("connected", `Reconnecting to ${cmd.wsUrl}`);
+          this.addActivity({
+            kind: "connected",
+            label: `Reconnecting to ${cmd.wsUrl}`,
+          });
           break;
         }
 
@@ -790,7 +748,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
 
         case "login_success":
           this.patchState({
-            phase: "authenticating",
+            phase: "recovering",
             qrCode: null,
             qrExpiresAt: null,
             userProfile: toBroadcastUserProfile(event.userProfile),
@@ -933,17 +891,11 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
 
   // ── Activity log ─────────────────────────────────────────────────────────
 
-  private addActivity(
-    kind: SocketActivity["kind"],
-    label: string,
-    byteLen?: number,
-  ): void {
-    const activity = toActivity(kind, label, byteLen);
-    // Persist to SQL for full history
-    this.persistActivity(activity);
-    this.patchState({
-      socketActivity: trimActivity([...this.state.socketActivity, activity]),
-    });
+  protected override addActivity(
+    activity: Omit<SocketActivity, "id" | "ts">,
+    limit?: number,
+  ): SocketActivity {
+    return super.addActivity(activity, limit);
   }
 
   // ── @callable() RPC methods ──────────────────────────────────────────────
@@ -971,7 +923,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
       this.syncRecoveryState();
 
       // 1. Create initial state machine session
-      const initResult = await createZaloSession({
+      const initResult = await this.createMachineSession({
         mode: "qr",
         userAgent: "Mozilla/5.0",
         language: "vi",
@@ -995,7 +947,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
         async (qrImage: string) => {
           // Transition state machine with QR data
           if (this.snapshot) {
-            const result = await transitionSession(this.snapshot, {
+            const result = await this.transitionMachineSession(this.snapshot, {
               type: "http_login_qr_result",
               qrData: {
                 image: qrImage,
@@ -1018,7 +970,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
         // onScanned
         async (info) => {
           if (this.snapshot) {
-            const result = await transitionSession(this.snapshot, {
+            const result = await this.transitionMachineSession(this.snapshot, {
               type: "qr_scan_event",
               event: "scanned",
               data: info,
@@ -1036,7 +988,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
 
       // 3. Login succeeded — transition state machine with credentials
       if (this.snapshot) {
-        const result = await transitionSession(this.snapshot, {
+        const result = await this.transitionMachineSession(this.snapshot, {
           type: "http_login_creds_result",
           credentials: loginResult.credentials,
           userProfile: loginResult.userProfile,
@@ -1054,7 +1006,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
       console.error("[ZaloAgent] initiateQRLogin failed:", errorMsg);
 
       if (this.snapshot) {
-        const result = await transitionSession(this.snapshot, {
+        const result = await this.transitionMachineSession(this.snapshot, {
           type: "http_login_failed",
           errorMessage: errorMsg,
         });
@@ -1103,7 +1055,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
       };
 
       // Create state machine in credentials mode
-      const initResult = await createZaloSession({
+      const initResult = await this.createMachineSession({
         mode: "credentials",
         credentials,
         userAgent: input.userAgent,
@@ -1128,7 +1080,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
 
       if (!validationResult.ok) {
         if (this.snapshot) {
-          const result = await transitionSession(this.snapshot, {
+          const result = await this.transitionMachineSession(this.snapshot, {
             type: "http_login_failed",
             errorMessage: validationResult.error,
           });
@@ -1139,7 +1091,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
 
       // Transition with login result
       if (this.snapshot) {
-        const result = await transitionSession(this.snapshot, {
+        const result = await this.transitionMachineSession(this.snapshot, {
           type: "http_login_creds_result",
           credentials: validationResult.credentials,
           userProfile: validationResult.userProfile,
@@ -1219,7 +1171,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
       );
 
       // Prepare the new state-machine snapshot before any bridge frames arrive.
-      const initResult = await createZaloSession({
+      const initResult = await this.createMachineSession({
         mode: "credentials",
         credentials: validationResult.credentials,
         userAgent: validationResult.credentials.userAgent,
@@ -1227,7 +1179,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
       });
 
       // Transition to ws_connecting with the login result
-      const result = await transitionSession(initResult.snapshot, {
+      const result = await this.transitionMachineSession(initResult.snapshot, {
         type: "http_login_creds_result",
         credentials: validationResult.credentials,
         userProfile: validationResult.userProfile,
@@ -1253,7 +1205,10 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
         result.events.filter((event) => event.type !== "login_success"),
       );
 
-      this.addActivity("connected", "Session recovered from persisted credentials");
+      this.addActivity({
+        kind: "connected",
+        label: "Session recovered from persisted credentials",
+      });
       this.startPing();
       this.setState({
         ...this.state,
@@ -1312,7 +1267,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
       phase: this.state.phase,
       socketStatus: this.state.socketStatus,
       hasPersistedCredentials: this.credentials != null,
-      hasActiveBridge: this.bridgeSocketId != null,
+      hasActiveBridge: this.loadBridgeInfo() != null,
       lastUserMessageId: this.lastUserMessageId,
       lastUserMessageTs: this.lastUserMessageTs,
       lastGroupMessageId: this.lastGroupMessageId,
@@ -1325,13 +1280,14 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     { ok: true; status: BridgeStatusResponse }
     | { ok: false; error: string }
   > {
-    if (!this.bridgeSocketId) {
+    const bridge = this.loadBridgeInfo();
+    if (!bridge) {
       return { ok: false, error: "No active bridge socket" };
     }
     try {
       const status = await getBridgeSessionStatus(
-        resolveBridgeUrl(this.env.BRIDGE_URL),
-        this.bridgeSocketId,
+        bridge.bridgeUrl,
+        bridge.socketId,
       );
       return { ok: true, status };
     } catch (err) {
@@ -1461,7 +1417,7 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
 
     if (this.snapshot) {
       try {
-        const result = await transitionSession(this.snapshot, {
+        const result = await this.transitionMachineSession(this.snapshot, {
           type: "logout",
         });
         await this.executeCommands(result.commands);
@@ -1555,13 +1511,17 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     }
 
     const frame = new Uint8Array(bytes);
-    this.addActivity("frame_in", `Inbound frame (${frame.byteLength}B)`, frame.byteLength);
+    this.addActivity({
+      kind: "frame_in",
+      label: `Inbound frame (${frame.byteLength}B)`,
+      byteLen: frame.byteLength,
+    });
 
     try {
-      const result = await transitionSession(this.snapshot, {
-        type: "inbound_frame",
+      const result = await this.transitionMachineWithInboundFrame(
+        this.snapshot,
         frame,
-      });
+      );
       await this.applyTransition(result);
     } catch (err) {
       console.error("[ZaloAgent] pushFrame transition error:", err);
@@ -1576,7 +1536,10 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
     this.ensureSql();
 
     this.markReconnect();
-    this.addActivity("disconnected", `Socket closed: ${code} ${reason}`);
+    this.addActivity({
+      kind: "disconnected",
+      label: `Socket closed: ${code} ${reason}`,
+    });
     this.stopPing();
 
     if (!this.snapshot) {
@@ -1590,11 +1553,14 @@ export class ZaloAgent extends Agent<Env, ZaloState> {
 
     // Let the state machine handle ws_closed
     try {
-      const result = await transitionSession(this.snapshot, {
-        type: "ws_closed",
+      const result = await this.transitionMachineWithSocketClose(
+        this.snapshot,
         code,
         reason,
-      });
+      );
+      if (!result) {
+        throw new Error("Socket close transitions are unsupported");
+      }
 
       // The state machine will emit reconnect commands if appropriate
       await this.applyTransition(result);

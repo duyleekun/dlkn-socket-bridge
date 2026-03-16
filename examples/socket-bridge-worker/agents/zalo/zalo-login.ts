@@ -197,52 +197,47 @@ export async function performQRLogin(
     }
   };
 
+  let qrLoginError: unknown = null;
+  let qrLoginApi: ZaloApiLike | null = null;
   try {
-    const api = (await zalo.loginQR(
+    qrLoginApi = (await zalo.loginQR(
       { userAgent, language },
       handleEvent,
     )) as unknown as ZaloApiLike;
-
-    if (!loginState.imei) {
-      throw new Error("zca-js login succeeded without an imei");
-    }
-
-    return buildLoginResultFromApi(
-      api,
-      {
-        imei: loginState.imei,
-        userAgent: loginState.userAgent,
-        language,
-      },
-      loginState.scanInfo,
-    );
   } catch (error) {
-    if (!loginState.imei || loginState.cookies.length === 0) {
-      throw error;
-    }
+    qrLoginError = error;
+  }
 
-    console.warn(
-      "[zalo-login] loginQR produced credentials but final login failed; retrying with captured credentials",
-      error,
-    );
-
-    const api = await loginWithRetries({
-      imei: loginState.imei,
-      cookie: loginState.cookies,
-      userAgent: loginState.userAgent,
-      language,
-    });
-
-    return buildLoginResultFromApi(
-      api,
-      {
-        imei: loginState.imei,
-        userAgent: loginState.userAgent,
-        language,
-      },
-      loginState.scanInfo,
+  if (!loginState.imei || loginState.cookies.length === 0) {
+    throw (
+      qrLoginError
+      ?? new Error("zca-js QR login completed without emitting credentials")
     );
   }
+
+  if (qrLoginError) {
+    console.warn(
+      "[zalo-login] loginQR produced credentials but final login failed; retrying with captured credentials",
+      qrLoginError,
+    );
+  }
+
+  const api = qrLoginApi ?? await loginWithRetries({
+    imei: loginState.imei,
+    cookie: loginState.cookies,
+    userAgent: loginState.userAgent,
+    language,
+  });
+
+  return buildLoginResultFromApi(
+    api,
+    {
+      imei: loginState.imei,
+      userAgent: loginState.userAgent,
+      language,
+    },
+    loginState.scanInfo,
+  );
 }
 
 /**

@@ -1,10 +1,8 @@
-import { Agent, unstable_callable as callable } from "agents";
+import { unstable_callable as callable } from "agents";
 import QRCode from "qrcode";
 import {
-  createSession,
-  transitionSession,
   invokeSessionMethod,
-  selectSessionView,
+  sessionRuntimeAdapter as telegramRuntime,
   buildTelegramGetDifferenceParams,
   extractTelegramUpdatesState,
   classifyDecryptedFrame,
@@ -15,16 +13,19 @@ import {
   type SessionSnapshot,
   type SessionCommand,
   type SessionEvent,
+  type SessionHostEvent,
+  type SessionStateValue,
+  type SessionView,
+  type CreateSessionInput,
   type TelegramUpdatesState,
 } from "gramjs-statemachine";
-import { createSession as createBridgeSession, sendBytes, closeSession, getStatus } from "./shared/bridge-client";
-import { normalizeUrl, resolveBridgeUrl } from "./shared/bridge-url";
+import { sendBytes, getStatus } from "./shared/bridge-client";
+import { StateMachineBridgeAgent } from "./shared/base-agent";
 import type {
   Env,
   TelegramState,
   TelegramPhase,
   SocketActivity,
-  CallbackRecord,
   ParsedPacketEntry,
   ParsedPacketKind,
   BridgeStatusResponse,
@@ -37,8 +38,19 @@ import { DEFAULT_TELEGRAM_STATE } from "./shared/types";
 //   tg_messages(id TEXT PK, peer_id TEXT, text TEXT, ts INTEGER, outgoing INTEGER)
 //   tg_packets(id TEXT PK, data TEXT, ts INTEGER)   ← parsed MTProto frames
 
-export class TelegramAgent extends Agent<Env, TelegramState> {
+export class TelegramAgent extends StateMachineBridgeAgent<
+  TelegramState,
+  CreateSessionInput,
+  SessionHostEvent,
+  SessionSnapshot,
+  SessionStateValue,
+  SessionCommand,
+  SessionEvent,
+  SessionView
+> {
   initialState = DEFAULT_TELEGRAM_STATE;
+  protected readonly platform = "telegram" as const;
+  protected readonly runtimeAdapter = telegramRuntime;
   static readonly #UPDATES_STATE_KEY = "updates_state";
 
   // In-memory snapshot cache — shared across all concurrent requests on the
@@ -87,6 +99,18 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
     this.sql`DELETE FROM tg_session WHERE key = ${key}`;
   }
 
+  protected override kvGet(key: string): string | null {
+    return this.#getPrivate(key);
+  }
+
+  protected override kvSet(key: string, value: string): void {
+    this.#setPrivate(key, value);
+  }
+
+  protected override kvDel(key: string): void {
+    this.#deletePrivate(key);
+  }
+
   #loadSnapshot(): SessionSnapshot | null {
     if (this.#snapshotCache) return this.#snapshotCache;
     const raw = this.#getPrivate("snapshot");
@@ -106,31 +130,15 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
   }
 
   #resolveRequestOrigin(origin?: string): string {
-    if (origin) {
-      const normalizedOrigin = normalizeUrl(origin);
-      this.#setPrivate("request_origin", normalizedOrigin);
-      return normalizedOrigin;
-    }
-
-    const persistedOrigin = this.#getPrivate("request_origin");
-    if (!persistedOrigin) {
-      throw new Error("Missing request origin");
-    }
-    return persistedOrigin;
+    return super.resolveRequestOrigin(origin);
   }
 
   #loadBridgeInfo(): { socketId: string; bridgeUrl: string; callbackKey: string } | null {
-    const raw = this.#getPrivate("bridge_info");
-    if (!raw) return null;
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return null;
-    }
+    return super.loadBridgeInfo();
   }
 
   #saveBridgeInfo(info: { socketId: string; bridgeUrl: string; callbackKey: string }): void {
-    this.#setPrivate("bridge_info", JSON.stringify(info));
+    super.saveBridgeInfo(info);
   }
 
   #loadUpdatesState(): TelegramUpdatesState | null {
@@ -277,17 +285,7 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
   }
 
   async #closePersistedBridge(): Promise<void> {
-    const bridge = this.#loadBridgeInfo();
-    if (!bridge) return;
-
-    try {
-      await closeSession(bridge.bridgeUrl, bridge.socketId);
-    } catch {
-      /* ignore */
-    }
-
-    await this.env.BRIDGE_KV.delete(`callback:${bridge.callbackKey}`);
-    this.#deletePrivate("bridge_info");
+    await this.closeBridgeConnection();
   }
 
   async #reconnectAuthenticatedSession(
@@ -295,25 +293,9 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
   ): Promise<void> {
     this.#manualSocketClose = false;
     await this.#closePersistedBridge();
-
-    const bridgeUrl = resolveBridgeUrl(this.env.BRIDGE_URL);
-    const requestOrigin = this.#resolveRequestOrigin();
-    const callbackKey = crypto.randomUUID();
-
-    const bridgeResp = await createBridgeSession(
-      bridgeUrl,
+    await this.createBridgeConnection(
       `mtproto-frame://${snapshot.context.dcIp}:${snapshot.context.dcPort}`,
-      `${requestOrigin}/cb/${callbackKey}`,
     );
-
-    const record: CallbackRecord = { platform: "telegram", instanceId: this.#instanceId() };
-    await this.env.BRIDGE_KV.put(`callback:${callbackKey}`, JSON.stringify(record));
-
-    this.#saveBridgeInfo({
-      socketId: bridgeResp.socket_id,
-      bridgeUrl,
-      callbackKey,
-    });
 
     const probe = await invokeSessionMethod(snapshot, "updates.GetState", undefined);
     this.#saveSnapshot(probe.snapshot);
@@ -362,24 +344,13 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
   // this.name throws if called before the Agent framework sets it.
   // this.ctx.id.name is always available when the DO was created via idFromName().
   #instanceId(): string {
-    try {
-      return (this.ctx.id as DurableObjectId & { name?: string }).name ?? this.ctx.id.toString();
-    } catch {
-      return this.ctx.id.toString();
-    }
+    return super.instanceId();
   }
 
   // ── Activity log (bounded, last 20) ────────────────────────────────────
 
   #addActivity(activity: Omit<SocketActivity, "id" | "ts">): void {
-    const entry: SocketActivity = {
-      id: crypto.randomUUID(),
-      ts: Date.now(),
-      ...activity,
-    };
-    const current = this.state.socketActivity;
-    const next = [...current, entry].slice(-20);
-    this.setState({ ...this.state, socketActivity: next, updatedAt: Date.now() });
+    super.addActivity(activity);
   }
 
   // ── Phase → state helpers ───────────────────────────────────────────────
@@ -407,7 +378,7 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
   async #applySnapshot(snap: SessionSnapshot): Promise<void> {
     this.#initSchema();
     this.#saveSnapshot(snap);
-    const view = selectSessionView(snap);
+    const view = this.selectMachineView(snap);
     const phase = this.#phaseFromSnapshot(snap);
 
     const patch: Partial<TelegramState> = {
@@ -481,44 +452,15 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
           byteLen: cmd.frame.length,
         });
       } else if (cmd.type === "reconnect") {
-        // Create a new bridge session for the new DC
-        const newCallbackKey = crypto.randomUUID();
-        const requestOrigin = this.#resolveRequestOrigin();
-        const bridgeUrl = resolveBridgeUrl(this.env.BRIDGE_URL);
-
-        const resp = await createBridgeSession(
-          bridgeUrl,
+        const nextBridge = await this.replaceBridgeConnection(
           `mtproto-frame://${cmd.dcIp}:${cmd.dcPort}`,
-          `${requestOrigin}/cb/${newCallbackKey}`,
         );
-
-        // Update KV: register new callback key, remove old one
-        const record: CallbackRecord = { platform: "telegram", instanceId: this.#instanceId() };
-        await Promise.all([
-          this.env.BRIDGE_KV.put(`callback:${newCallbackKey}`, JSON.stringify(record)),
-          this.env.BRIDGE_KV.delete(`callback:${bridge.callbackKey}`),
-        ]);
-
-        // Close old socket
-        try {
-          await closeSession(bridge.bridgeUrl, bridge.socketId);
-        } catch {
-          /* ignore */
-        }
-
-        // Save new bridge info
-        this.#saveBridgeInfo({
-          socketId: resp.socket_id,
-          bridgeUrl,
-          callbackKey: newCallbackKey,
-        });
         this.#addActivity({
           kind: "connected",
           label: `\u21BA reconnect DC ${cmd.dcIp}:${cmd.dcPort}`,
         });
 
-        // Send first frame on new connection
-        await sendBytes(bridgeUrl, resp.socket_id, cmd.firstFrame);
+        await sendBytes(nextBridge.current.bridgeUrl, nextBridge.current.socketId, cmd.firstFrame);
         this.#addActivity({
           kind: "frame_out",
           label: `\u2192 firstFrame (${cmd.firstFrame.length}B)`,
@@ -574,7 +516,7 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
 
     if (stale && (options.assumeBridgeDead || !this.#loadBridgeInfo())) {
       this.#snapshotCache = null;
-      this.#deletePrivate("bridge_info");
+      this.clearBridgeInfo();
       this.setState({
         ...this.state,
         ...this.#loadRecoveryState(),
@@ -598,11 +540,9 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
       this.#initSchema();
       this.#clearRecoveryState();
       this.#syncRecoveryStateIntoBroadcast();
-      const bridgeUrl = resolveBridgeUrl(this.env.BRIDGE_URL);
-      const requestOrigin = this.#resolveRequestOrigin(input.requestOrigin);
-      const callbackKey = crypto.randomUUID();
+      this.#resolveRequestOrigin(input.requestOrigin);
 
-      const initial = await createSession({
+      const initial = await this.createMachineSession({
         apiId: this.env.TELEGRAM_API_ID,
         apiHash: this.env.TELEGRAM_API_HASH,
         dcMode: "production",
@@ -615,21 +555,9 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
       this.#saveSnapshot(initial.snapshot);
       console.log("[TelegramAgent.startAuth] snapshot saved, instanceId:", this.#instanceId(), "cacheSet:", this.#snapshotCache !== null);
 
-      const bridgeResp = await createBridgeSession(
-        bridgeUrl,
+      await this.createBridgeConnection(
         `mtproto-frame://${initial.snapshot.context.dcIp}:${initial.snapshot.context.dcPort}`,
-        `${requestOrigin}/cb/${callbackKey}`,
       );
-
-      // Register callback routing in KV
-      const record: CallbackRecord = { platform: "telegram", instanceId: this.#instanceId() };
-      await this.env.BRIDGE_KV.put(`callback:${callbackKey}`, JSON.stringify(record));
-
-      this.#saveBridgeInfo({
-        socketId: bridgeResp.socket_id,
-        bridgeUrl,
-        callbackKey,
-      });
       this.setState({
         ...this.state,
         phase: "connecting",
@@ -661,7 +589,10 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
       if (!snap || snap.value !== "awaiting_code") {
         return { ok: false, error: "Not in awaiting_code state" };
       }
-      const result = await transitionSession(snap, { type: "submit_code", code: input.code });
+      const result = await this.transitionMachineSession(snap, {
+        type: "submit_code",
+        code: input.code,
+      });
       await this.#applySnapshot(result.snapshot);
       await this.#executeCommands(result.commands);
       return { ok: true };
@@ -680,7 +611,7 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
       if (!snap || snap.value !== "awaiting_password") {
         return { ok: false, error: "Not in awaiting_password state" };
       }
-      const result = await transitionSession(snap, {
+      const result = await this.transitionMachineSession(snap, {
         type: "submit_password",
         password: input.password,
       });
@@ -700,7 +631,9 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
       this.#initSchema();
       const snap = this.#loadSnapshot();
       if (!snap) return { ok: false, error: "No session" };
-      const result = await transitionSession(snap, { type: "refresh_qr" });
+      const result = await this.transitionMachineSession(snap, {
+        type: "refresh_qr",
+      });
       await this.#applySnapshot(result.snapshot);
       await this.#executeCommands(result.commands);
       return { ok: true };
@@ -920,7 +853,7 @@ export class TelegramAgent extends Agent<Env, TelegramState> {
     }
 
     try {
-      const result = await transitionSession(snap, { type: "inbound_frame", frame: raw });
+      const result = await this.transitionMachineWithInboundFrame(snap, raw);
       this.#saveSnapshot(result.snapshot);
       await this.#updateRecoveryFromEvents(result.snapshot, result.events);
       await this.#executeCommands(result.commands);

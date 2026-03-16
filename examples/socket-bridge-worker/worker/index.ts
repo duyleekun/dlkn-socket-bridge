@@ -14,6 +14,34 @@ import { ZaloAgent } from "../agents/zalo-agent";
 import type { CallbackRecord, Env } from "../agents/shared/types";
 export { TelegramAgent, ZaloAgent };
 
+type CallbackAgentStub = {
+  pushFrame(b: ArrayBuffer): Promise<void>;
+  onSocketClosed(code: number, reason: string): Promise<void>;
+};
+
+function getAgentStub(
+  namespace: DurableObjectNamespace,
+  record: CallbackRecord,
+): CallbackAgentStub {
+  if (record.instanceId) {
+    try {
+      return namespace.get(
+        namespace.idFromString(record.instanceId),
+      ) as unknown as CallbackAgentStub;
+    } catch {
+      // Legacy records used the instance name in the instanceId field.
+    }
+  }
+
+  if (!record.instanceName) {
+    throw new Error("Callback record is missing agent routing information");
+  }
+
+  return namespace.get(
+    namespace.idFromName(record.instanceName),
+  ) as unknown as CallbackAgentStub;
+}
+
 function isJsonCloseEvent(bytes: Uint8Array): boolean {
   try {
     const text = new TextDecoder().decode(bytes);
@@ -54,9 +82,7 @@ export default {
       const isClose = isJsonCloseEvent(new Uint8Array(rawBytes));
 
       if (record.platform === "telegram") {
-        const stub = env.TELEGRAM_AGENT.get(
-          env.TELEGRAM_AGENT.idFromString(record.instanceId),
-        ) as unknown as { pushFrame(b: ArrayBuffer): Promise<void>; onSocketClosed(code: number, reason: string): Promise<void> };
+        const stub = getAgentStub(env.TELEGRAM_AGENT, record);
         if (isClose) {
           const { code, reason } = parseCloseEvent(new Uint8Array(rawBytes));
           await stub.onSocketClosed(code, reason);
@@ -64,9 +90,7 @@ export default {
           await stub.pushFrame(rawBytes);
         }
       } else {
-        const stub = env.ZALO_AGENT.get(
-          env.ZALO_AGENT.idFromString(record.instanceId),
-        ) as unknown as { pushFrame(b: ArrayBuffer): Promise<void>; onSocketClosed(code: number, reason: string): Promise<void> };
+        const stub = getAgentStub(env.ZALO_AGENT, record);
         if (isClose) {
           const { code, reason } = parseCloseEvent(new Uint8Array(rawBytes));
           await stub.onSocketClosed(code, reason);

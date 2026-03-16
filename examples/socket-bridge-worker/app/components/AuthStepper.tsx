@@ -1,6 +1,6 @@
 "use client";
 
-interface Step {
+export interface Step {
   key: string;
   label: string;
 }

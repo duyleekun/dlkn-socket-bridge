@@ -7,7 +7,7 @@
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
     "dev:bridge-rs": "pnpm -C packages/dlkn-socket-bridge-rs run dev",
-    "dev:bridge-worker": "concurrently --kill-others-on-fail --names bridge,worker \"pnpm -C packages/dlkn-socket-bridge-rs run dev\" \"pnpm -C examples/socket-bridge-worker run dev\"",
+    "dev:bridge-worker": "concurrently --kill-others-on-fail --names bridge,worker \"pnpm -C packages/dlkn-socket-bridge-rs run dev\" \"pnpm -C examples/socket-bridge-worker run dev\""
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

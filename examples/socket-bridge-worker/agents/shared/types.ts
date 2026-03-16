@@ -13,7 +13,8 @@ export interface Env {
 // KV callback routing record — maps callbackKey → Agent DO
 export interface CallbackRecord {
   platform: "telegram" | "zalo";
-  instanceId: string; // DO name / userId
+  instanceName?: string; // canonical Agent/DO name when workerd exposes it
+  instanceId?: string; // canonical durable object id string for idFromString routing
 }
 
 export interface BridgeCreateResponse {

@@ -13,7 +13,6 @@ import {
   persistSessionCookie,
   restoreSessionFromCookie,
 } from "../actions/telegram";
-import { StatusBadge } from "./StatusBadge";
 import { SocketActivityLog } from "./SocketActivityLog";
 import { QRDisplay } from "./QRDisplay";
 import { PacketLogViewer } from "./PacketLogViewer";
@@ -22,6 +21,13 @@ import {
   TELEGRAM_STEPS,
   getTelegramStepperState,
 } from "./AuthStepper";
+import {
+  ActionGrid,
+  AgentPanelShell,
+  PanelButton,
+  PanelMessage,
+  PanelSection,
+} from "./AgentPanel";
 
 interface TelegramPanelProps {
   instanceId: string;
@@ -50,6 +56,16 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
   const [rpcParams, setRpcParams] = useState("{}");
   const [toolMessage, setToolMessage] = useState<string | null>(null);
   const shouldRecoverRef = useRef(false);
+
+  function resetToDefaultInstance(message?: string) {
+    setResolvedInstanceId(instanceId);
+    setState(DEFAULT_TELEGRAM_STATE);
+    setFullPackets(null);
+    setBridgeStatus(null);
+    setUpdatesState(null);
+    setToolMessage(message ?? null);
+    shouldRecoverRef.current = false;
+  }
 
   const agent = useAgent<TelegramState>({
     agent: "telegram-agent",
@@ -99,7 +115,7 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
         resolvedInstanceId !== instanceId
       ) {
         await clearSessionCookie();
-        setResolvedInstanceId(instanceId);
+        resetToDefaultInstance();
         shouldRecoverRef.current = true;
       }
     }).catch(() => {
@@ -163,10 +179,12 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
   async function handleLogout() {
     await agent.call("logout", []);
     await clearSessionCookie();
-    setBridgeStatus(null);
-    setUpdatesState(null);
-    setToolMessage("Telegram session cleared.");
-    setResolvedInstanceId(crypto.randomUUID());
+    resetToDefaultInstance("Telegram session cleared.");
+  }
+
+  async function handleClearLocalSession() {
+    await clearSessionCookie();
+    resetToDefaultInstance("Local Telegram session cleared.");
   }
 
   async function handleRecover() {
@@ -179,9 +197,8 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
       resolvedInstanceId !== instanceId
     ) {
       await clearSessionCookie();
-      setResolvedInstanceId(instanceId);
+      resetToDefaultInstance("Retrying recovery on default instance.");
       shouldRecoverRef.current = true;
-      setToolMessage("Retrying recovery on default instance.");
       return;
     }
 
@@ -245,7 +262,11 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
       { ok: true } | { ok: false; error: string }
     >);
     setBridgeStatus(null);
-    setToolMessage(result.ok ? "Socket closed." : result.error);
+    setToolMessage(
+      result.ok
+        ? "Socket closed. Use Recover session to attach a fresh bridge without clearing Telegram auth."
+        : result.error,
+    );
   }
 
   async function handleLoadAllPackets() {
@@ -254,22 +275,13 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
   }
 
   return (
-    <div className="card p-6 space-y-5">
-      <div className="flex items-start justify-between gap-3">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2">
-            <div className="h-3 w-3 rounded-full bg-telegram" />
-            <p className="text-xs font-semibold uppercase tracking-widest text-muted">
-              Telegram
-            </p>
-          </div>
-          <StatusBadge phase={phase} socketStatus={socketStatus} />
-        </div>
-        <div className="text-right text-[11px] text-muted">
-          <div className="font-medium text-foreground">Instance</div>
-          <div className="max-w-[12rem] truncate">{resolvedInstanceId}</div>
-        </div>
-      </div>
+    <AgentPanelShell
+      accentClassName="bg-telegram"
+      instanceId={resolvedInstanceId}
+      phase={phase}
+      socketStatus={socketStatus}
+      title="Telegram"
+    >
 
       {phase !== "idle" && phase !== "error" && (
         <AuthStepper
@@ -280,14 +292,17 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
       )}
 
       {phase === "idle" && (
-        <div className="space-y-4">
+        <PanelSection
+          title="Start session"
+          description="Choose how to authenticate this Telegram agent instance."
+        >
           <fieldset className="space-y-2">
             <legend className="text-sm font-medium text-foreground">
-              Auth Mode
+              Sign-in mode
             </legend>
             <div className="grid grid-cols-2 gap-2">
               {(["qr", "phone"] as const).map((mode) => (
-                <button
+                <PanelButton
                   key={mode}
                   type="button"
                   onClick={() => setAuthMode(mode)}
@@ -297,8 +312,8 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
                       : "border-card-border text-muted hover:text-foreground"
                   }`}
                 >
-                  {mode === "qr" ? "QR Login" : "Phone Code"}
-                </button>
+                  {mode === "qr" ? "QR sign-in" : "Phone code"}
+                </PanelButton>
               ))}
             </div>
           </fieldset>
@@ -321,49 +336,81 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
           )}
 
           <div className="grid gap-2 sm:grid-cols-2">
-            <button
+            <PanelButton
               onClick={() => void handleStartAuth()}
-              className="rounded-lg bg-telegram px-4 py-2.5 text-sm font-medium text-white hover:opacity-90 transition-opacity"
+              className="bg-telegram text-white hover:opacity-90"
             >
-              Start Auth
-            </button>
-            <button
+              Start session
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleRecover()}
-              className="rounded-lg border border-card-border bg-surface px-4 py-2.5 text-sm font-medium text-foreground hover:bg-zinc-800/50"
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800/50"
             >
-              Recover Session
-            </button>
+              Recover session
+            </PanelButton>
+          </div>
+        </PanelSection>
+      )}
+
+      {phase === "connecting" && (
+        <div className="space-y-3">
+          <div className="flex flex-col items-center gap-3 py-6">
+            <div className="animate-spin h-8 w-8 border-3 border-telegram border-t-transparent rounded-full" />
+            <p className="text-sm text-muted">Connecting to Telegram...</p>
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <PanelButton
+              onClick={() => void handleLogout()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Logout
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Clear local session
+            </PanelButton>
           </div>
         </div>
       )}
 
-      {phase === "connecting" && (
-        <div className="flex flex-col items-center gap-3 py-6">
-          <div className="animate-spin h-8 w-8 border-3 border-telegram border-t-transparent rounded-full" />
-          <p className="text-sm text-muted">Connecting to Telegram...</p>
-        </div>
-      )}
-
       {phase === "waiting_qr_scan" && (
-        <div className="flex flex-col items-center">
-          <QRDisplay
-            qrCode={qrCode}
-            expiresAt={qrExpiresAt}
-            onRefresh={handleRefreshQr}
-            label="Scan with Telegram"
-          />
+        <div className="space-y-3">
+          <div className="flex flex-col items-center">
+            <QRDisplay
+              qrCode={qrCode}
+              expiresAt={qrExpiresAt}
+              onRefresh={handleRefreshQr}
+              label="Scan with Telegram"
+            />
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <PanelButton
+              onClick={() => void handleLogout()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Logout
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Clear local session
+            </PanelButton>
+          </div>
         </div>
       )}
 
       {phase === "qr_expired" && (
         <div className="space-y-3 text-center">
           <p className="text-sm text-warning">QR code has expired.</p>
-          <button
+          <PanelButton
             onClick={handleRefreshQr}
-            className="rounded-lg bg-telegram px-4 py-2 text-sm font-medium text-white hover:opacity-90"
+            className="bg-telegram py-2 text-white hover:opacity-90"
           >
-            Generate New QR
-          </button>
+            Refresh QR
+          </PanelButton>
         </div>
       )}
 
@@ -384,12 +431,26 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
             placeholder="12345"
             className="w-full rounded-lg border border-card-border bg-surface px-4 py-2.5 text-center text-lg tracking-widest text-foreground outline-none ring-telegram focus:ring-2"
           />
-          <button
-            onClick={() => void handleSubmitCode()}
-            className="w-full rounded-lg bg-telegram px-4 py-2.5 text-sm font-medium text-white hover:opacity-90"
-          >
-            Submit Code
-          </button>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <PanelButton
+              onClick={() => void handleSubmitCode()}
+              className="bg-telegram text-white hover:opacity-90 sm:col-span-3"
+            >
+              Submit code
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleLogout()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Logout
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800 sm:col-span-2"
+            >
+              Clear local session
+            </PanelButton>
+          </div>
         </div>
       )}
 
@@ -409,12 +470,26 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
             placeholder="Password"
             className="w-full rounded-lg border border-card-border bg-surface px-4 py-2.5 text-foreground outline-none ring-telegram focus:ring-2"
           />
-          <button
-            onClick={() => void handleSubmitPassword()}
-            className="w-full rounded-lg bg-telegram px-4 py-2.5 text-sm font-medium text-white hover:opacity-90"
-          >
-            Submit Password
-          </button>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <PanelButton
+              onClick={() => void handleSubmitPassword()}
+              className="bg-telegram text-white hover:opacity-90 sm:col-span-3"
+            >
+              Submit password
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleLogout()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Logout
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800 sm:col-span-2"
+            >
+              Clear local session
+            </PanelButton>
+          </div>
         </div>
       )}
 
@@ -445,57 +520,57 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
             </div>
           </div>
 
-          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            <button
+          <ActionGrid>
+            <PanelButton
               onClick={() => void handleCheckSocket()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm font-medium text-foreground hover:bg-zinc-800/50"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800/50"
             >
-              Check Socket
-            </button>
-            <button
+              Refresh bridge
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleLoadUpdatesState()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm font-medium text-foreground hover:bg-zinc-800/50"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800/50"
             >
-              Read Updates State
-            </button>
-            <button
+              Read updates state
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleInvokeState()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm font-medium text-foreground hover:bg-zinc-800/50"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800/50"
             >
               updates.GetState
-            </button>
-            <button
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleInvokeDifference()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm font-medium text-foreground hover:bg-zinc-800/50"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800/50"
             >
               updates.GetDifference
-            </button>
-            <button
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleRecover()}
-              className="rounded-lg border border-card-border bg-surface px-3 py-2 text-sm font-medium text-foreground hover:bg-zinc-800/50"
+              className="border border-card-border bg-surface px-3 py-2 text-foreground hover:bg-zinc-800/50"
             >
-              Recover Bridge
-            </button>
-            <button
+              Recover session
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleCloseSocket()}
-              className="rounded-lg border border-error/30 bg-error/10 px-3 py-2 text-sm font-medium text-error hover:bg-error/15"
+              className="border border-error/30 bg-error/10 px-3 py-2 text-error hover:bg-error/15"
             >
-              Close Socket
-            </button>
-          </div>
+              Disconnect socket
+            </PanelButton>
+          </ActionGrid>
 
-          <div className="space-y-2 rounded-xl border border-card-border bg-surface p-4">
+          <PanelSection
+            title="Manual RPC"
+            description="Queue any Telegram API method against the active session."
+          >
             <div className="flex items-center justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-semibold text-foreground">Manual RPC</h3>
-                <p className="text-xs text-muted">Queue any Telegram API method.</p>
-              </div>
-              <button
+              <div />
+              <PanelButton
                 onClick={() => void handleManualMethod()}
-                className="rounded-lg bg-telegram px-3 py-2 text-sm font-medium text-white hover:opacity-90"
+                className="bg-telegram px-3 py-2 text-white hover:opacity-90"
               >
                 Send
-              </button>
+              </PanelButton>
             </div>
             <input
               type="text"
@@ -510,7 +585,7 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
               rows={4}
               className="w-full rounded-lg border border-card-border bg-background px-3 py-2 text-sm text-foreground outline-none ring-telegram focus:ring-2"
             />
-          </div>
+          </PanelSection>
 
           {bridgeStatus && (
             <pre className="rounded-xl border border-card-border bg-surface p-3 text-xs text-zinc-200 overflow-x-auto">
@@ -550,51 +625,59 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
           )}
 
           <div className="grid gap-2 sm:grid-cols-2">
-            <button
+            <PanelButton
               onClick={() => void handleLoadAllPackets()}
-              className="rounded-lg border border-card-border bg-surface px-4 py-2.5 text-sm font-medium text-foreground hover:bg-zinc-800/50"
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800/50"
             >
-              Load Full Packet Log
-            </button>
-            <button
+              Load packet history
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleLogout()}
-              className="rounded-lg border border-card-border bg-surface px-4 py-2.5 text-sm font-medium text-foreground hover:bg-zinc-800/50"
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800/50"
             >
               Logout
-            </button>
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800/50 sm:col-span-2"
+            >
+              Clear local session
+            </PanelButton>
           </div>
         </div>
       )}
 
       {phase === "error" && (
         <div className="space-y-3">
-          <div className="rounded-lg border border-error/30 bg-error/10 p-4">
-            <p className="text-sm font-medium text-error">Error</p>
-            <p className="text-xs text-error/80 mt-1">
-              {error || "Unknown error"}
-            </p>
-          </div>
-          <div className="grid gap-2 sm:grid-cols-2">
-            <button
+          <PanelMessage tone="error">
+            <p className="font-medium">Error</p>
+            <p className="mt-1 text-xs">{error || "Unknown error"}</p>
+          </PanelMessage>
+          <div className="grid gap-2 sm:grid-cols-3">
+            <PanelButton
               onClick={() => void handleRetry()}
-              className="rounded-lg bg-surface border border-card-border px-4 py-2.5 text-sm font-medium text-foreground hover:bg-zinc-800 transition-colors"
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
             >
-              Try Again
-            </button>
-            <button
+              Retry
+            </PanelButton>
+            <PanelButton
               onClick={() => void handleRecover()}
-              className="rounded-lg bg-surface border border-card-border px-4 py-2.5 text-sm font-medium text-foreground hover:bg-zinc-800 transition-colors"
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
             >
-              Recover Session
-            </button>
+              Recover session
+            </PanelButton>
+            <PanelButton
+              onClick={() => void handleClearLocalSession()}
+              className="border border-card-border bg-surface text-foreground hover:bg-zinc-800"
+            >
+              Clear local session
+            </PanelButton>
           </div>
         </div>
       )}
 
       {toolMessage && (
-        <div className="rounded-lg border border-card-border bg-surface px-4 py-3 text-sm text-muted">
-          {toolMessage}
-        </div>
+        <PanelMessage>{toolMessage}</PanelMessage>
       )}
 
       {phase !== "idle" && <SocketActivityLog entries={state.socketActivity} />}
@@ -606,6 +689,6 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
           fullLoaded={fullPackets !== null}
         />
       )}
-    </div>
+    </AgentPanelShell>
   );
 }
