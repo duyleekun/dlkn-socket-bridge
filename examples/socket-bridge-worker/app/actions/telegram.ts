@@ -2,7 +2,6 @@
 
 import { cookies } from "next/headers";
 import { env as cfEnv } from "cloudflare:workers";
-import type { Env } from "../../agents/shared/types";
 
 const SESSION_COOKIE_NAME = "tg_session";
 

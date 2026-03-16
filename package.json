@@ -6,8 +6,9 @@
     "build": "pnpm -r --if-present build",
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
-    "dev:bridge-rs": "pnpm -C packages/dlkn-socket-bridge-rs run dev",
-    "dev:bridge-worker": "concurrently --kill-others-on-fail --names bridge,worker \"pnpm -C packages/dlkn-socket-bridge-rs run dev\" \"pnpm -C examples/socket-bridge-worker run dev\""
+    "dev:bridge-rs": "DURABLE_SOCKET_URL=ws://127.0.0.1:5173/ds/control pnpm -C packages/dlkn-socket-bridge-rs run dev",
+    "dev:bridge-worker": "pnpm -C examples/socket-bridge-worker run dev",
+    "dev": "concurrently --kill-others-on-fail --names bridge-rs,bridge-worker \"pnpm dev:bridge-rs\" \"pnpm dev:bridge-worker\""
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

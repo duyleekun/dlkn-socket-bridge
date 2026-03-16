@@ -1,35 +1,3 @@
-export interface Env {
-  TELEGRAM_AGENT: DurableObjectNamespace;
-  ZALO_AGENT: DurableObjectNamespace;
-  BRIDGE_KV: KVNamespace;
-  ASSETS: Fetcher;
-  TELEGRAM_API_ID: string;
-  TELEGRAM_API_HASH: string;
-  TELEGRAM_SESSION_COOKIE_SECRET: string;
-  ZALO_SESSION_COOKIE_SECRET: string;
-  BRIDGE_URL: string;
-}
-
-// KV callback routing record — maps callbackKey → Agent DO
-export interface CallbackRecord {
-  platform: "telegram" | "zalo";
-  instanceName?: string; // canonical Agent/DO name when workerd exposes it
-  instanceId?: string; // canonical durable object id string for idFromString routing
-}
-
-export interface BridgeCreateResponse {
-  socket_id: string;
-  send_url: string;
-  delete_url: string;
-}
-
-export interface BridgeStatusResponse {
-  protocol: string;
-  uptime_secs: number;
-  bytes_rx: number;
-  bytes_tx: number;
-}
-
 export interface SocketActivity {
   id: string;
   kind: "frame_in" | "frame_out" | "connected" | "disconnected" | "error" | "fsm_transition";

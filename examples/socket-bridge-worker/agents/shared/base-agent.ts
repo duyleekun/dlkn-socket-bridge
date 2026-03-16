@@ -1,24 +1,15 @@
 import { Agent } from "agents";
+import type { Connection, ConnectionContext } from "agents";
 import type {
   SessionRuntimeAdapter,
   SessionTransitionResult,
 } from "shared-statemachine";
-import {
-  closeSession,
-  createSession as createBridgeSession,
-} from "./bridge-client";
-import { normalizeUrl, resolveBridgeUrl } from "./bridge-url";
 import type {
-  BridgeCreateResponse,
-  CallbackRecord,
-  Env,
   SocketActivity,
 } from "./types";
 
 export interface BridgeConnectionInfo {
-  socketId: string;
-  bridgeUrl: string;
-  callbackKey: string;
+  socketKey: string;
 }
 
 export interface BridgeAgentState {
@@ -29,15 +20,26 @@ export interface BridgeAgentState {
 export abstract class SocketBridgeAgent<
   TState extends BridgeAgentState,
 > extends Agent<Env, TState> {
-  protected abstract readonly platform: CallbackRecord["platform"];
+  protected abstract readonly platform: "telegram" | "zalo";
 
   protected activityStateLimit = 20;
+
+  // Frames queued while the bridge data WS is still being established.
+  // Drained automatically once the bridge connects via onConnect().
+  // NOTE: we persist these to KV storage so they survive across DO instance
+  // boundaries (miniflare creates separate instances per WebSocket connection).
+  #pendingBridgeFrames: Uint8Array[] = [];
+  static readonly #PENDING_FRAMES_KEY = "pending_bridge_frames";
 
   protected abstract kvGet(key: string): string | null;
 
   protected abstract kvSet(key: string, value: string): void;
 
   protected abstract kvDel(key: string): void;
+
+  protected abstract pushFrame(frame: Uint8Array): Promise<void>;
+
+  protected abstract onSocketClosed(code: number, reason: string): Promise<void>;
 
   protected normalizeState(nextState: TState): TState {
     return nextState;
@@ -72,7 +74,13 @@ export abstract class SocketBridgeAgent<
 
   protected instanceName(): string | null {
     try {
-      return (this.ctx.id as DurableObjectId & { name?: string }).name ?? null;
+      // ctx.id.name is only present when DO was created via idFromName().
+      // In miniflare/workerd dev mode this property is often undefined even
+      // for named IDs, so we also check our own KV-persisted copy which is
+      // written from the browser WebSocket URL the first time a client connects.
+      const fromId = (this.ctx.id as DurableObjectId & { name?: string }).name ?? null;
+      if (fromId) return fromId;
+      return this.kvGet("instance_name");
     } catch {
       return null;
     }
@@ -91,7 +99,7 @@ export abstract class SocketBridgeAgent<
 
   protected resolveRequestOrigin(origin?: string): string {
     if (origin) {
-      const normalizedOrigin = normalizeUrl(origin);
+      const normalizedOrigin = origin.trim().replace(/\/+$/, "");
       this.kvSet("request_origin", normalizedOrigin);
       return normalizedOrigin;
     }
@@ -104,139 +112,178 @@ export abstract class SocketBridgeAgent<
   }
 
   protected loadBridgeInfo(): BridgeConnectionInfo | null {
-    const socketId = this.kvGet("bridge_socket_id");
-    const bridgeUrl = this.kvGet("bridge_url");
-    const callbackKey = this.kvGet("callback_key");
-    if (socketId && bridgeUrl && callbackKey) {
-      return { socketId, bridgeUrl, callbackKey };
-    }
-
-    const legacy = this.parseJson<BridgeConnectionInfo>(this.kvGet("bridge_info"));
-    if (!legacy?.socketId || !legacy.bridgeUrl || !legacy.callbackKey) {
-      return null;
-    }
-
-    this.saveBridgeInfo(legacy);
-    return legacy;
+    const socketKey = this.kvGet("bridge_socket_key");
+    if (socketKey) return { socketKey };
+    return null;
   }
 
   protected saveBridgeInfo(info: BridgeConnectionInfo): void {
-    this.kvSet("bridge_socket_id", info.socketId);
-    this.kvSet("bridge_url", info.bridgeUrl);
-    this.kvSet("callback_key", info.callbackKey);
-    this.kvSet("bridge_info", JSON.stringify(info));
+    this.kvSet("bridge_socket_key", info.socketKey);
   }
 
   protected clearBridgeInfo(): void {
+    this.kvDel("bridge_socket_key");
+    // Also clean up old keys for backward compat
     this.kvDel("bridge_socket_id");
     this.kvDel("bridge_url");
     this.kvDel("callback_key");
     this.kvDel("bridge_info");
   }
 
-  protected async registerCallback(callbackKey: string): Promise<void> {
-    const instanceName = this.instanceName();
-    const record: CallbackRecord = {
-      platform: this.platform,
-      instanceId: this.ctx.id.toString(),
-      ...(instanceName ? { instanceName } : {}),
-    };
-    await this.env.BRIDGE_KV.put(
-      `callback:${callbackKey}`,
-      JSON.stringify(record),
-    );
-  }
-
-  protected async deleteCallback(callbackKey?: string | null): Promise<void> {
-    if (!callbackKey) {
-      return;
-    }
-    await this.env.BRIDGE_KV.delete(`callback:${callbackKey}`);
-  }
-
   protected async createBridgeConnection(
     targetUrl: string,
     options?: { headers?: Record<string, string> },
   ): Promise<BridgeConnectionInfo> {
-    const bridgeUrl = resolveBridgeUrl(this.env.BRIDGE_URL);
-    const callbackKey = crypto.randomUUID();
-    const callbackUrl = `${this.resolveRequestOrigin()}/cb/${callbackKey}`;
+    const socketKey = crypto.randomUUID();
+    const origin = this.resolveRequestOrigin();
+    const agentClass = this.platform === "telegram" ? "telegram-agent" : "zalo-agent";
+    const instanceName = this.instanceName() ?? this.ctx.id.toString();
 
-    const response = await createBridgeSession(
-      bridgeUrl,
+    // Data WS URL — bridge connects here (same path browser uses, distinguished by X-Bridge: 1)
+    const agentDataWsUrl = `${origin.replace(/^http/, "ws")}/agents/${agentClass}/${instanceName}`;
+    console.log("[bridge] createBridgeConnection: instanceName()=", this.instanceName(), "instanceName=", instanceName, "agentDataWsUrl=", agentDataWsUrl);
+
+    const dsStub = this.#durableSocketStub();
+    const result = await dsStub.createSession(
+      socketKey,
       targetUrl,
-      callbackUrl,
-      options,
+      agentDataWsUrl,
+      this.platform,
+      this.ctx.id.toString(),
+      instanceName,
+      options?.headers,
     );
+    if (!result.ok) {
+      throw new Error(`DurableSocket.createSession failed: ${(result as { ok: false; error: string }).error}`);
+    }
 
-    await this.registerCallback(callbackKey);
-
-    const info = {
-      socketId: response.socket_id,
-      bridgeUrl,
-      callbackKey,
-    };
+    const info: BridgeConnectionInfo = { socketKey };
     this.saveBridgeInfo(info);
     return info;
   }
 
-  protected async replaceBridgeConnection(
-    targetUrl: string,
-    options?: { headers?: Record<string, string> },
-  ): Promise<{
-    previous: BridgeConnectionInfo | null;
-    current: BridgeConnectionInfo;
-    response: BridgeCreateResponse;
-  }> {
-    const previous = this.loadBridgeInfo();
-    const bridgeUrl = resolveBridgeUrl(this.env.BRIDGE_URL);
-    const callbackKey = crypto.randomUUID();
-    const callbackUrl = `${this.resolveRequestOrigin()}/cb/${callbackKey}`;
+  protected sendBridgeBytes(data: Uint8Array): void {
+    for (const conn of this.getConnections()) {
+      const state = conn.state as { isBridge?: boolean } | null;
+      if (state?.isBridge) {
+        conn.send(data);
+        return;
+      }
+    }
+    // Bridge data WS not yet connected — persist the frame so it gets sent
+    // as soon as the bridge connects (see onConnect flush below).
+    // We persist to KV storage because the bridge WebSocket connection may be
+    // handled by a different DO instance (e.g. in miniflare local dev).
+    console.warn("[bridge] sendBridgeBytes: bridge not yet connected, persisting frame to queue");
+    this.#pendingBridgeFrames.push(data);
+    this.#persistPendingFrames();
+  }
 
-    const response = await createBridgeSession(
-      bridgeUrl,
-      targetUrl,
-      callbackUrl,
-      options,
-    );
+  #persistPendingFrames(): void {
+    if (this.#pendingBridgeFrames.length === 0) {
+      this.kvDel(SocketBridgeAgent.#PENDING_FRAMES_KEY);
+      return;
+    }
+    // Encode each Uint8Array as a base64 string for JSON serialisation.
+    const encoded = this.#pendingBridgeFrames.map((f) => btoa(String.fromCharCode(...f)));
+    this.kvSet(SocketBridgeAgent.#PENDING_FRAMES_KEY, JSON.stringify(encoded));
+  }
 
-    await this.registerCallback(callbackKey);
-
-    const current = {
-      socketId: response.socket_id,
-      bridgeUrl,
-      callbackKey,
-    };
-    this.saveBridgeInfo(current);
-
-    await Promise.all([
-      this.deleteCallback(previous?.callbackKey),
-      previous
-        ? closeSession(previous.bridgeUrl, previous.socketId).catch(() => undefined)
-        : Promise.resolve(),
-    ]);
-
-    return {
-      previous,
-      current,
-      response,
-    };
+  #loadPersistedFrames(): Uint8Array[] {
+    const raw = this.kvGet(SocketBridgeAgent.#PENDING_FRAMES_KEY);
+    console.log("[bridge] #loadPersistedFrames: raw=", raw ? `${raw.slice(0, 60)}…` : "null");
+    if (!raw) return [];
+    try {
+      const encoded = JSON.parse(raw) as string[];
+      return encoded.map((b64) => {
+        const binary = atob(b64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+      });
+    } catch (err) {
+      console.warn("[bridge] #loadPersistedFrames: parse error", err);
+      return [];
+    }
   }
 
   protected async closeBridgeConnection(): Promise<void> {
-    const bridge = this.loadBridgeInfo();
-    if (!bridge) {
+    this.#pendingBridgeFrames = [];
+    this.kvDel(SocketBridgeAgent.#PENDING_FRAMES_KEY);
+    for (const conn of this.getConnections()) {
+      const state = conn.state as { isBridge?: boolean } | null;
+      if (state?.isBridge) {
+        conn.close(1000, "agent_close");
+      }
+    }
+    this.clearBridgeInfo();
+  }
+
+  async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    if (ctx.request?.headers.get("X-Bridge") === "1") {
+      connection.setState({ isBridge: true });
+      console.log("[bridge] bridge data WS connected");
+      // Load persisted frames (works across DO instance boundaries)
+      const persisted = this.#loadPersistedFrames();
+      const all = [...this.#pendingBridgeFrames, ...persisted];
+      if (all.length > 0) {
+        console.log(`[bridge] flushing ${all.length} queued frame(s) to bridge`);
+        for (const frame of all) {
+          connection.send(frame);
+        }
+        this.#pendingBridgeFrames = [];
+        this.kvDel(SocketBridgeAgent.#PENDING_FRAMES_KEY);
+      }
       return;
     }
-
-    try {
-      await closeSession(bridge.bridgeUrl, bridge.socketId);
-    } catch {
-      // Socket may already be gone; callback cleanup still needs to run.
+    // Browser connection — persist the instance name from the URL path so
+    // createBridgeConnection can use it even when ctx.id.name is unavailable
+    // (e.g. in miniflare where DurableObjectId.name is not exposed).
+    if (ctx.request) {
+      try {
+        const url = new URL(ctx.request.url);
+        // Path format: /agents/<agent-class>/<instance-name>
+        const parts = url.pathname.split("/").filter(Boolean);
+        // parts = ["agents", "<class>", "<name>"]
+        if (parts.length >= 3 && parts[0] === "agents") {
+          const nameFromUrl = parts[2];
+          if (nameFromUrl && !this.kvGet("instance_name")) {
+            this.kvSet("instance_name", nameFromUrl);
+          }
+        }
+      } catch {
+        // URL parsing failure is non-fatal
+      }
     }
+    // Default Agents SDK behavior for browser connections
+    return super.onConnect?.(connection, ctx);
+  }
 
-    await this.deleteCallback(bridge.callbackKey);
-    this.clearBridgeInfo();
+  async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
+    const state = connection.state as { isBridge?: boolean } | null;
+    if (state?.isBridge) {
+      if (message instanceof ArrayBuffer) {
+        await this.pushFrame(new Uint8Array(message));
+      }
+      return;
+    }
+    return super.onMessage?.(connection, message);
+  }
+
+  async onClose(connection: Connection, code: number, reason: string, wasClean: boolean): Promise<void> {
+    const state = connection.state as { isBridge?: boolean } | null;
+    if (state?.isBridge) {
+      console.log("[bridge] bridge data WS closed, code:", code, "reason:", reason);
+      await this.onSocketClosed(code, reason || "bridge_close");
+      return;
+    }
+    return super.onClose?.(connection, code, reason, wasClean);
+  }
+
+  #durableSocketStub() {
+    return this.env.DURABLE_SOCKET.get(
+      this.env.DURABLE_SOCKET.idFromName("default"),
+    );
   }
 
   protected addActivity(

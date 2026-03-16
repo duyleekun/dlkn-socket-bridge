@@ -1,4 +1,4 @@
-import { unstable_callable as callable } from "agents";
+import { unstable_callable as callable, type Connection, type ConnectionContext } from "agents";
 import QRCode from "qrcode";
 import {
   invokeSessionMethod,
@@ -19,16 +19,13 @@ import {
   type CreateSessionInput,
   type TelegramUpdatesState,
 } from "gramjs-statemachine";
-import { sendBytes, getStatus } from "./shared/bridge-client";
 import { StateMachineBridgeAgent } from "./shared/base-agent";
 import type {
-  Env,
   TelegramState,
   TelegramPhase,
   SocketActivity,
   ParsedPacketEntry,
   ParsedPacketKind,
-  BridgeStatusResponse,
 } from "./shared/types";
 import { DEFAULT_TELEGRAM_STATE } from "./shared/types";
 
@@ -133,12 +130,8 @@ export class TelegramAgent extends StateMachineBridgeAgent<
     return super.resolveRequestOrigin(origin);
   }
 
-  #loadBridgeInfo(): { socketId: string; bridgeUrl: string; callbackKey: string } | null {
+  #loadBridgeInfo(): { socketKey: string } | null {
     return super.loadBridgeInfo();
-  }
-
-  #saveBridgeInfo(info: { socketId: string; bridgeUrl: string; callbackKey: string }): void {
-    super.saveBridgeInfo(info);
   }
 
   #loadUpdatesState(): TelegramUpdatesState | null {
@@ -445,14 +438,15 @@ export class TelegramAgent extends StateMachineBridgeAgent<
       }
 
       if (cmd.type === "send_frame") {
-        await sendBytes(bridge.bridgeUrl, bridge.socketId, cmd.frame);
+        this.sendBridgeBytes(cmd.frame);
         this.#addActivity({
           kind: "frame_out",
           label: `\u2192 frame (${cmd.frame.length}B)`,
           byteLen: cmd.frame.length,
         });
       } else if (cmd.type === "reconnect") {
-        const nextBridge = await this.replaceBridgeConnection(
+        await this.closeBridgeConnection();
+        await this.createBridgeConnection(
           `mtproto-frame://${cmd.dcIp}:${cmd.dcPort}`,
         );
         this.#addActivity({
@@ -460,7 +454,7 @@ export class TelegramAgent extends StateMachineBridgeAgent<
           label: `\u21BA reconnect DC ${cmd.dcIp}:${cmd.dcPort}`,
         });
 
-        await sendBytes(nextBridge.current.bridgeUrl, nextBridge.current.socketId, cmd.firstFrame);
+        this.sendBridgeBytes(cmd.firstFrame);
         this.#addActivity({
           kind: "frame_out",
           label: `\u2192 firstFrame (${cmd.firstFrame.length}B)`,
@@ -473,6 +467,7 @@ export class TelegramAgent extends StateMachineBridgeAgent<
   // ── Lifecycle ───────────────────────────────────────────────────────────
 
   async onStart() {
+    console.log("[TelegramAgent.onStart] called, instanceId:", this.#instanceId(), "phase:", this.state.phase);
     this.#initSchema();
     // Warm the in-memory snapshot cache from SQL on cold start so pushFrame
     // doesn't need a SQL read on its hot path.
@@ -492,7 +487,9 @@ export class TelegramAgent extends StateMachineBridgeAgent<
     this.#syncRecoveryStateIntoBroadcast();
   }
 
-  onConnect() {
+  async onConnect(connection: Connection, ctx: ConnectionContext) {
+    // Let base class handle bridge connections (X-Bridge: 1)
+    await super.onConnect(connection, ctx);
     this.#resetIfStale({ assumeBridgeDead: false });
     this.#syncRecoveryStateIntoBroadcast();
   }
@@ -657,28 +654,6 @@ export class TelegramAgent extends StateMachineBridgeAgent<
     }
   }
 
-  @callable()
-  async getBridgeSocketHealth(): Promise<
-    { ok: true; status: BridgeStatusResponse }
-    | { ok: false; error: string }
-  > {
-    try {
-      this.#initSchema();
-      const bridge = this.#loadBridgeInfo();
-      if (!bridge) {
-        return { ok: false, error: "No active bridge socket" };
-      }
-      return {
-        ok: true,
-        status: await getStatus(bridge.bridgeUrl, bridge.socketId),
-      };
-    } catch (err) {
-      return {
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-  }
 
   @callable()
   getTelegramUpdatesState(): TelegramUpdatesState | null {
@@ -837,9 +812,9 @@ export class TelegramAgent extends StateMachineBridgeAgent<
 
   // ── Server-side DO RPCs (Worker → Agent, called by worker/index.ts) ────
 
-  async pushFrame(bytes: ArrayBuffer): Promise<void> {
+  async pushFrame(frame: Uint8Array): Promise<void> {
     this.#initSchema();
-    const raw = new Uint8Array(bytes);
+    const raw = frame;
     this.#addActivity({
       kind: "frame_in",
       label: `\u2190 frame (${raw.length}B)`,

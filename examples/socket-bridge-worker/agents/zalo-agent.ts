@@ -4,10 +4,10 @@
  * Lifecycle:
  *   1. Client connects via WebSocket (Agent SDK handles that).
  *   2. Client calls initiateQRLogin() → HTTP QR flow via zca-js → bridge socket created.
- *   3. Bridge POSTs inbound frames to /cb/:callbackKey → pushFrame() → state machine.
+ *   3. Bridge connects via WebSocket with X-Bridge: 1 → pushFrame() → state machine.
  *   4. Auto-reconnect on socket close when authenticated.
  */
-import { unstable_callable as callable, type Connection } from "agents";
+import { unstable_callable as callable, type Connection, type ConnectionContext } from "agents";
 import { ThreadType } from "zca-js";
 import {
   sessionRuntimeAdapter as zaloRuntime,
@@ -39,19 +39,13 @@ import {
   type QRLoginResult,
 } from "./zalo/zalo-login";
 import {
-  getStatus as getBridgeSessionStatus,
-  sendBytes,
-} from "./shared/bridge-client";
-import {
   StateMachineBridgeAgent,
   type BridgeConnectionInfo,
 } from "./shared/base-agent";
 import type {
-  Env,
   ZaloState,
   ZaloPhase,
   SocketActivity,
-  BridgeStatusResponse,
 } from "./shared/types";
 import { DEFAULT_ZALO_STATE } from "./shared/types";
 
@@ -171,8 +165,6 @@ export class ZaloAgent extends StateMachineBridgeAgent<
 
   // Internal mutable state (not broadcast — persisted in SQL)
   private snapshot: SessionSnapshot | null = null;
-  private bridgeSocketId: string | null = null;
-  private callbackKey: string | null = null;
   private credentials: ZaloCredentials | null = null;
   private userProfile: ZaloUserProfile | null = null;
   private wsUrl: string | null = null;
@@ -194,7 +186,9 @@ export class ZaloAgent extends StateMachineBridgeAgent<
     await this.loadPersistedState();
   }
 
-  onConnect(connection: Connection, _ctx: ConnectionContext): void {
+  async onConnect(connection: Connection, ctx: ConnectionContext): Promise<void> {
+    // Let base class handle bridge connections (X-Bridge: 1)
+    await super.onConnect(connection, ctx);
     // Send current state to newly connected client
     connection.send(JSON.stringify(this.state));
   }
@@ -464,10 +458,7 @@ export class ZaloAgent extends StateMachineBridgeAgent<
     if (pingRaw) this.pingIntervalMs = parseInt(pingRaw, 10) || 20_000;
 
     const bridge = this.loadBridgeInfo();
-    if (bridge) {
-      this.bridgeSocketId = bridge.socketId;
-      this.callbackKey = bridge.callbackKey;
-    }
+    // bridge info is managed by base class, no local caching needed
 
     const seqRaw = this.kvGet("last_event_seq");
     this.lastEventSeq = seqRaw ? Number(seqRaw) || 0 : 0;
@@ -567,14 +558,10 @@ export class ZaloAgent extends StateMachineBridgeAgent<
 
   protected override saveBridgeInfo(info: BridgeConnectionInfo): void {
     super.saveBridgeInfo(info);
-    this.bridgeSocketId = info.socketId;
-    this.callbackKey = info.callbackKey;
   }
 
   protected override clearBridgeInfo(): void {
     super.clearBridgeInfo();
-    this.bridgeSocketId = null;
-    this.callbackKey = null;
   }
 
   protected override onActivity(entry: SocketActivity): void {
@@ -586,11 +573,10 @@ export class ZaloAgent extends StateMachineBridgeAgent<
   private async createBridgeSocket(
     wsUrl: string,
   headers?: Record<string, string>,
-  ): Promise<{ socketId: string; callbackKey: string }> {
-    const bridge = await this.createBridgeConnection(wsUrl, {
+  ): Promise<void> {
+    await this.createBridgeConnection(wsUrl, {
       headers,
     });
-    return { socketId: bridge.socketId, callbackKey: bridge.callbackKey };
   }
 
   private async closeBridgeSocket(): Promise<void> {
@@ -601,12 +587,8 @@ export class ZaloAgent extends StateMachineBridgeAgent<
     }
   }
 
-  private async sendToBridge(data: Uint8Array): Promise<void> {
-    const bridge = this.loadBridgeInfo();
-    if (!bridge) {
-      throw new Error("No active bridge socket");
-    }
-    await sendBytes(bridge.bridgeUrl, bridge.socketId, data);
+  private sendToBridge(data: Uint8Array): void {
+    this.sendBridgeBytes(data);
     this.addActivity({
       kind: "frame_out",
       label: `Outbound frame (${data.byteLength}B)`,
@@ -621,7 +603,7 @@ export class ZaloAgent extends StateMachineBridgeAgent<
     this.pingTimer = setInterval(async () => {
       try {
         const pingFrame = buildPingFrame();
-        await this.sendToBridge(pingFrame);
+        this.sendToBridge(pingFrame);
       } catch (err) {
         console.warn("[ZaloAgent] ping error:", err);
       }
@@ -655,7 +637,7 @@ export class ZaloAgent extends StateMachineBridgeAgent<
         case "send_ping": {
           try {
             const pingFrame = buildPingFrame();
-            await this.sendToBridge(pingFrame);
+            this.sendToBridge(pingFrame);
           } catch (err) {
             console.warn("[ZaloAgent] send_ping error:", err);
           }
@@ -668,7 +650,7 @@ export class ZaloAgent extends StateMachineBridgeAgent<
               cmd.threadType,
               cmd.lastMessageId,
             );
-            await this.sendToBridge(frame);
+            this.sendToBridge(frame);
           } catch (err) {
             console.warn("[ZaloAgent] request_old_messages error:", err);
           }
@@ -1196,7 +1178,7 @@ export class ZaloAgent extends StateMachineBridgeAgent<
       );
       await this.closeBridgeSocket();
       await this.createBridgeSocket(validationResult.wsUrl, headers);
-      await this.sendToBridge(buildPingFrame());
+      this.sendToBridge(buildPingFrame());
 
       // Don't execute commands here — the bridge socket was already created above.
       // The synthetic login_success event reflects the pre-listening snapshot, so
@@ -1275,28 +1257,6 @@ export class ZaloAgent extends StateMachineBridgeAgent<
     };
   }
 
-  @callable()
-  async getBridgeStatus(): Promise<
-    { ok: true; status: BridgeStatusResponse }
-    | { ok: false; error: string }
-  > {
-    const bridge = this.loadBridgeInfo();
-    if (!bridge) {
-      return { ok: false, error: "No active bridge socket" };
-    }
-    try {
-      const status = await getBridgeSessionStatus(
-        bridge.bridgeUrl,
-        bridge.socketId,
-      );
-      return { ok: true, status };
-    } catch (err) {
-      return {
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-  }
 
   @callable()
   async fetchMissingEvents(): Promise<{
@@ -1307,7 +1267,7 @@ export class ZaloAgent extends StateMachineBridgeAgent<
   }> {
     this.resolveCursorFromStoredMessages();
 
-    if (!this.bridgeSocketId) {
+    if (!this.loadBridgeInfo()) {
       return {
         ok: false,
         error: "No active bridge socket",
@@ -1334,7 +1294,7 @@ export class ZaloAgent extends StateMachineBridgeAgent<
 
     try {
       for (const command of commands) {
-        await this.sendToBridge(
+        this.sendToBridge(
           buildOldMessagesFrame(command.threadType, command.lastMessageId),
         );
       }
@@ -1500,9 +1460,9 @@ export class ZaloAgent extends StateMachineBridgeAgent<
 
   /**
    * Feed inbound bytes from the Rust bridge.
-   * Called by the worker's /cb/:callbackKey handler.
+   * Called by the base class when a bridge WebSocket sends binary frames.
    */
-  async pushFrame(bytes: ArrayBuffer): Promise<void> {
+  async pushFrame(frame: Uint8Array): Promise<void> {
     this.ensureSql();
 
     if (!this.snapshot) {
@@ -1510,7 +1470,6 @@ export class ZaloAgent extends StateMachineBridgeAgent<
       return;
     }
 
-    const frame = new Uint8Array(bytes);
     this.addActivity({
       kind: "frame_in",
       label: `Inbound frame (${frame.byteLength}B)`,
@@ -1581,5 +1540,3 @@ export class ZaloAgent extends StateMachineBridgeAgent<
   }
 }
 
-// Required for Agent class type checking
-type ConnectionContext = unknown;

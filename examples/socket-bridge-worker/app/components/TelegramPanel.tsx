@@ -3,7 +3,6 @@
 import { useAgent } from "agents/react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
-  BridgeStatusResponse,
   ParsedPacketEntry,
   TelegramState,
 } from "../../agents/shared/types";
@@ -50,7 +49,7 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
   const [password, setPassword] = useState("");
   const [authMode, setAuthMode] = useState<"qr" | "phone">("qr");
   const [fullPackets, setFullPackets] = useState<ParsedPacketEntry[] | null>(null);
-  const [bridgeStatus, setBridgeStatus] = useState<BridgeStatusResponse | null>(null);
+  const [bridgeStatus, setBridgeStatus] = useState<{ connected: boolean } | null>(null);
   const [updatesState, setUpdatesState] = useState<TelegramUpdatesState | null>(null);
   const [rpcMethod, setRpcMethod] = useState("help.GetConfig");
   const [rpcParams, setRpcParams] = useState("{}");
@@ -208,7 +207,7 @@ export default function TelegramPanel({ instanceId }: TelegramPanelProps) {
 
   async function handleCheckSocket() {
     const result = await (agent.call("getBridgeSocketHealth", []) as Promise<
-      { ok: true; status: BridgeStatusResponse }
+      { ok: true; status: { connected: boolean } }
       | { ok: false; error: string }
     >);
     if (result.ok) {
