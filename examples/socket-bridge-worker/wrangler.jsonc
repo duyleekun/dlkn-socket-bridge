@@ -12,17 +12,15 @@
   "durable_objects": {
     "bindings": [
       { "name": "TELEGRAM_AGENT", "class_name": "TelegramAgent" },
-      { "name": "ZALO_AGENT", "class_name": "ZaloAgent" }
+      { "name": "ZALO_AGENT", "class_name": "ZaloAgent" },
+      { "name": "DURABLE_SOCKET", "class_name": "DurableSocket" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["TelegramAgent", "ZaloAgent"] }
-  ],
-  "kv_namespaces": [
-    { "binding": "BRIDGE_KV", "id": "CREATE_ME" }
+    { "tag": "v1", "new_sqlite_classes": ["TelegramAgent", "ZaloAgent"] },
+    { "tag": "v2", "new_sqlite_classes": ["DurableSocket"] }
   ]
   // Secrets (wrangler secret put):
   //   TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_COOKIE_SECRET
   //   ZALO_SESSION_COOKIE_SECRET
-  //   BRIDGE_URL (Rust bridge URL)
 }
