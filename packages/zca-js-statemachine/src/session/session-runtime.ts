@@ -1,9 +1,10 @@
 import { parseSocketFrame } from '../framing/socket.js';
+import { createSessionTransitionResult } from 'shared-statemachine';
 import { createInitialState } from '../types/state.js';
 import type { ZaloSerializedState } from '../types/state.js';
-import type { ZaloSessionCommand } from '../types/session-command.js';
-import type { ZaloSessionEvent } from '../types/session-event.js';
-import type { ZaloSessionTransitionResult } from '../types/session-result.js';
+import type { SessionCommand } from '../types/session-command.js';
+import type { SessionEvent } from '../types/session-event.js';
+import type { SessionTransitionResult } from '../types/session-result.js';
 import { buildZaloWsHeaders } from '../ws-url/ws-url.js';
 import {
   createSnapshotFromState,
@@ -12,26 +13,29 @@ import {
   type ZaloStateMachineValue,
   type CreateSessionInput,
 } from './session-snapshot.js';
+import { selectSessionView } from './session-view.js';
 import { runSessionMachine } from './session-machine.js';
 
 function makeResult(
   value: ZaloStateMachineValue,
   context: ZaloSerializedState,
-  commands: ZaloSessionCommand[],
-  events: ZaloSessionEvent[],
-): ZaloSessionTransitionResult {
-  return {
-    snapshot: createSnapshotFromState(value, context),
+  commands: SessionCommand[],
+  events: SessionEvent[],
+): SessionTransitionResult {
+  const snapshot = createSnapshotFromState(value, context);
+  return createSessionTransitionResult(
+    snapshot,
     commands,
     events,
-  };
+    selectSessionView(snapshot),
+  );
 }
 
 function isRemoteLogoutClose(code: number, reason: string): boolean {
   return code === 1000 && reason.trim().toLowerCase() === 'error';
 }
 
-export async function createSession(input: CreateSessionInput): Promise<ZaloSessionTransitionResult> {
+export async function createSession(input: CreateSessionInput): Promise<SessionTransitionResult> {
   const state = createInitialState({
     userAgent: input.userAgent,
     language: input.language,
@@ -56,7 +60,7 @@ export async function createSession(input: CreateSessionInput): Promise<ZaloSess
 async function applyHostEvent(
   snapshot: SessionSnapshot,
   event: ZaloSessionHostEvent,
-): Promise<{ snapshot: SessionSnapshot; commands: ZaloSessionCommand[]; events: ZaloSessionEvent[] }> {
+): Promise<{ snapshot: SessionSnapshot; commands: SessionCommand[]; events: SessionEvent[] }> {
   const ctx = snapshot.context;
 
   switch (event.type) {
@@ -66,8 +70,8 @@ async function applyHostEvent(
       });
       let nextValue = snapshot.value;
       let nextContext = ctx;
-      const commands: ZaloSessionCommand[] = [];
-      const events: ZaloSessionEvent[] = [];
+      const commands: SessionCommand[] = [];
+      const events: SessionEvent[] = [];
       let shouldSendPing = false;
 
       for (const parsedEvent of parsedEvents) {
@@ -129,7 +133,7 @@ async function applyHostEvent(
             : `WebSocket closed: ${event.reason} (${event.code})`,
         reconnectCount: isListening ? ctx.reconnectCount + 1 : ctx.reconnectCount,
       };
-      const commands: ZaloSessionCommand[] = [];
+      const commands: SessionCommand[] = [];
       if (remoteLogout) {
         commands.push({ type: 'clear_credentials' });
       } else if (isListening && ctx.wsUrl && ctx.credentials) {
@@ -253,6 +257,6 @@ async function applyHostEvent(
 export async function transitionSession(
   snapshot: SessionSnapshot,
   event: ZaloSessionHostEvent,
-): Promise<ZaloSessionTransitionResult> {
+): Promise<SessionTransitionResult> {
   return runSessionMachine(snapshot, event, applyHostEvent);
 }

@@ -19,6 +19,7 @@
   "dependencies": {
     "big-integer": "^1.6.52",
     "robot3": "^1.2.0",
+    "shared-statemachine": "workspace:*",
     "telegram": "2.26.22"
   },
   "devDependencies": {

@@ -1,21 +1,25 @@
 import * as robot3 from 'robot3';
-import type { ZaloSessionEvent } from '../types/session-event.js';
-import type { ZaloSessionCommand } from '../types/session-command.js';
-import type { ZaloSessionTransitionResult } from '../types/session-result.js';
+import { createSessionTransitionResult, withRuntimeView } from 'shared-statemachine';
+import type { SessionEvent } from '../types/session-event.js';
+import type { SessionCommand } from '../types/session-command.js';
+import type { SessionTransitionResult } from '../types/session-result.js';
 import type { ZaloSessionHostEvent, SessionSnapshot, ZaloStateMachineValue } from './session-snapshot.js';
-
-const robot3Api = (
-  (robot3 as { default?: typeof import('robot3') }).default ?? robot3
-) as typeof import('robot3');
+import { selectSessionView } from './session-view.js';
+const robot3Api = robot3;
 
 interface TransitionPayload {
   snapshot: SessionSnapshot;
-  commands: ZaloSessionCommand[];
-  events: ZaloSessionEvent[];
+  commands: SessionCommand[];
+  events: SessionEvent[];
 }
 
-function emptyResult(snapshot: SessionSnapshot): ZaloSessionTransitionResult {
-  return { snapshot, commands: [], events: [] };
+function emptyResult(snapshot: SessionSnapshot): SessionTransitionResult {
+  return createSessionTransitionResult(
+    snapshot,
+    [],
+    [],
+    selectSessionView(snapshot),
+  );
 }
 
 function createTransitionMachine(initial: ZaloStateMachineValue) {
@@ -75,14 +79,14 @@ export async function runSessionMachine(
   snapshot: SessionSnapshot,
   event: ZaloSessionHostEvent,
   handler: (snapshot: SessionSnapshot, event: ZaloSessionHostEvent) => Promise<TransitionPayload>,
-): Promise<ZaloSessionTransitionResult> {
+): Promise<SessionTransitionResult> {
   if (!canHandleEvent(snapshot, event)) {
     return emptyResult(snapshot);
   }
   const payload = await handler(snapshot, event);
-  return {
+  return withRuntimeView({
     snapshot: payload.snapshot,
     commands: payload.commands,
     events: payload.events,
-  };
+  }, selectSessionView);
 }

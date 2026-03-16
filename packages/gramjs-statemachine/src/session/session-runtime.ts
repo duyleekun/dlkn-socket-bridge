@@ -1,4 +1,5 @@
 import type { InternalAction } from '../types/internal-action.js';
+import { createSessionTransitionResult } from 'shared-statemachine';
 import { createInitialState } from '../types/state.js';
 import type { SerializedState } from '../types/state.js';
 import type {
@@ -78,12 +79,12 @@ function toTransitionResult(
     commands.push(toSessionCommandReconnect(transport));
   }
   commands.push(...outbound.map(toSessionCommandOutbound));
-  return {
+  return createSessionTransitionResult(
     snapshot,
     commands,
     events,
-    view: selectSessionView(snapshot),
-  };
+    selectSessionView(snapshot),
+  );
 }
 
 function toErrorState(

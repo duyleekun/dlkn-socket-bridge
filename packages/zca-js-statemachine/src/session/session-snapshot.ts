@@ -13,6 +13,9 @@ export type ZaloStateMachineValue =
   | 'reconnecting'
   | 'error';
 
+export type SessionStateValue = ZaloStateMachineValue;
+export type SessionProtocolPhase = ZaloSerializedState['phase'];
+
 export interface SessionSnapshot {
   version: 1;
   value: ZaloStateMachineValue;
@@ -33,6 +36,8 @@ export type ZaloSessionHostEvent =
     }
   | { type: 'http_login_failed'; errorMessage: string }
   | { type: 'logout' };
+
+export type SessionHostEvent = ZaloSessionHostEvent;
 
 export interface CreateSessionInput {
   mode: 'qr' | 'credentials';

@@ -1,4 +1,5 @@
 import * as robot3 from 'robot3';
+import { createSessionTransitionResult, withRuntimeView } from 'shared-statemachine';
 import type { SessionEvent } from '../types/session-event.js';
 import type { SessionCommand } from '../types/session-command.js';
 import type { SessionTransitionResult } from '../types/session-result.js';
@@ -8,10 +9,7 @@ import type {
   SessionStateValue,
 } from './session-snapshot.js';
 import { selectSessionView } from './session-view.js';
-
-const robot3Api = (
-  (robot3 as { default?: typeof import('robot3') }).default ?? robot3
-) as typeof import('robot3');
+const robot3Api = robot3;
 
 interface TransitionPayload {
   snapshot: SessionSnapshot;
@@ -20,12 +18,12 @@ interface TransitionPayload {
 }
 
 function emptyResult(snapshot: SessionSnapshot): SessionTransitionResult {
-  return {
+  return createSessionTransitionResult(
     snapshot,
-    commands: [],
-    events: [],
-    view: selectSessionView(snapshot),
-  };
+    [],
+    [],
+    selectSessionView(snapshot),
+  );
 }
 
 function createTransitionMachine(initial: SessionStateValue) {
@@ -75,10 +73,9 @@ export async function runSessionMachine(
   }
 
   const payload = await handler(snapshot, event);
-  return {
+  return withRuntimeView({
     snapshot: payload.snapshot,
     commands: payload.commands,
     events: payload.events,
-    view: selectSessionView(payload.snapshot),
-  };
+  }, selectSessionView);
 }

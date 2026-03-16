@@ -1,9 +1,14 @@
-import type { ZaloSessionCommand } from './session-command.js';
-import type { ZaloSessionEvent } from './session-event.js';
+import type { SessionCommand } from './session-command.js';
+import type { SessionEvent } from './session-event.js';
 import type { SessionSnapshot } from '../session/session-snapshot.js';
+import type { SessionView } from '../session/session-view.js';
+import type { SessionTransitionResult as SharedSessionTransitionResult } from 'shared-statemachine';
 
-export interface ZaloSessionTransitionResult {
-  snapshot: SessionSnapshot;
-  commands: ZaloSessionCommand[];
-  events: ZaloSessionEvent[];
-}
+export type SessionTransitionResult = SharedSessionTransitionResult<
+  SessionSnapshot,
+  SessionCommand,
+  SessionEvent,
+  SessionView
+>;
+
+export type ZaloSessionTransitionResult = SessionTransitionResult;

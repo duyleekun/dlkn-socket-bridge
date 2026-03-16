@@ -1,16 +1,21 @@
 export { createSession, transitionSession } from './session/session-runtime.js';
+export { sessionRuntimeAdapter } from './session/runtime-adapter.js';
+export type { SessionRuntimeAdapter } from './session/runtime-adapter.js';
 export type {
   SessionSnapshot,
+  SessionHostEvent,
+  SessionStateValue,
+  SessionProtocolPhase,
   ZaloStateMachineValue,
   ZaloSessionHostEvent,
   CreateSessionInput,
 } from './session/session-snapshot.js';
 export { createSnapshotFromState } from './session/session-snapshot.js';
 export { selectSessionView } from './session/session-view.js';
-export type { ZaloSessionView } from './session/session-view.js';
-export type { ZaloSessionTransitionResult } from './types/session-result.js';
-export type { ZaloSessionCommand } from './types/session-command.js';
-export type { ZaloSessionEvent, ZaloProtocolEvent } from './types/session-event.js';
+export type { SessionView, ZaloSessionView } from './session/session-view.js';
+export type { SessionTransitionResult, ZaloSessionTransitionResult } from './types/session-result.js';
+export type { SessionCommand, ZaloSessionCommand } from './types/session-command.js';
+export type { SessionEvent, ZaloSessionEvent, ZaloProtocolEvent } from './types/session-event.js';
 export type {
   ZaloSerializedState,
   ZaloPhase,

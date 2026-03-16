@@ -1,6 +1,6 @@
 import type { ZaloCredentials } from './state.js';
 
-export type ZaloSessionCommand =
+export type SessionCommand =
   | { type: 'send_ping' }
   | { type: 'request_old_messages'; threadType: 0 | 1; lastMessageId: string }
   | { type: 'http_login_qr' }
@@ -8,3 +8,5 @@ export type ZaloSessionCommand =
   | { type: 'reconnect'; wsUrl: string; headers?: Record<string, string> }
   | { type: 'persist_credentials'; credentials: ZaloCredentials; userProfile: import('./state.js').ZaloUserProfile | null; wsUrl: string; pingIntervalMs: number }
   | { type: 'clear_credentials' };
+
+export type ZaloSessionCommand = SessionCommand;

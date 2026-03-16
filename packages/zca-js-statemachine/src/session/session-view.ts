@@ -1,6 +1,6 @@
 import type { SessionSnapshot } from './session-snapshot.js';
 
-export interface ZaloSessionView {
+export interface SessionView {
   phase: string;
   isConnected: boolean;
   isLoggedIn: boolean;
@@ -12,7 +12,9 @@ export interface ZaloSessionView {
   wsUrl?: string;
 }
 
-export function selectSessionView(snapshot: SessionSnapshot): ZaloSessionView {
+export type ZaloSessionView = SessionView;
+
+export function selectSessionView(snapshot: SessionSnapshot): SessionView {
   const ctx = snapshot.context;
   return {
     phase: snapshot.value,

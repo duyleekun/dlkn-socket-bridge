@@ -48,3 +48,9 @@ export {
   transitionSession,
 } from './session/session-runtime.js';
 export { selectSessionView } from './session/session-view.js';
+export {
+  sessionRuntimeAdapter,
+} from './session/runtime-adapter.js';
+export type {
+  SessionRuntimeAdapter,
+} from './session/runtime-adapter.js';
